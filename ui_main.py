@@ -2,7 +2,7 @@
 import os
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-    QLabel, QSplitter, QScrollArea, QLineEdit, QFileDialog, QMessageBox, QMenuBar, QInputDialog, QSizePolicy
+    QLabel, QSplitter, QScrollArea, QLineEdit, QFileDialog, QMessageBox, QMenuBar, QInputDialog, QSizePolicy, QComboBox
 )
 from PyQt6.QtGui import QPixmap, QAction
 from PyQt6.QtCore import Qt, QSize
@@ -101,10 +101,13 @@ class MainWindow(QMainWindow):
         # Batch Operations
         batch_layout = QHBoxLayout()
         self.add_all_btn = QPushButton("Add to All")
+        self.position_combo = QComboBox()
+        self.position_combo.addItems(["Add to End", "Add to Start"])
         self.remove_all_btn = QPushButton("Remove from All")
         self.add_all_btn.clicked.connect(self.add_tag_to_all)
         self.remove_all_btn.clicked.connect(self.remove_tag_from_all)
         batch_layout.addWidget(self.add_all_btn)
+        batch_layout.addWidget(self.position_combo)
         batch_layout.addWidget(self.remove_all_btn)
         right_layout.addLayout(batch_layout)
         
@@ -243,9 +246,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please enter a tag to add to all files.")
             return
             
-        reply = QMessageBox.question(self, 'Confirm', f"Add '{tag}' to all text files in this folder?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        position = "start" if self.position_combo.currentIndex() == 1 else "end"
+        action_text = "at the beginning of" if position == "start" else "to the end of"
+        reply = QMessageBox.question(self, 'Confirm', f"Add '{tag}' {action_text} all text files in this folder?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
-            count = self.file_manager.add_tag_to_all(tag)
+            count = self.file_manager.add_tag_to_all(tag, position)
             QMessageBox.information(self, "Success", f"Added '{tag}' to {count} files.")
             self.tag_input.clear()
             self.load_tags()

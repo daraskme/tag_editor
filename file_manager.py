@@ -70,12 +70,15 @@ class FileManager:
             return True
         return False
 
-    def add_tag_to_all(self, tag):
+    def add_tag_to_all(self, tag, position="end"):
         count = 0
         for img_path in self.image_files:
             tags = self.read_tags(img_path)
             if tag not in tags:
-                tags.append(tag)
+                if position == "start":
+                    tags.insert(0, tag)
+                else:
+                    tags.append(tag)
                 self.save_tags(img_path, tags)
                 count += 1
         return count
