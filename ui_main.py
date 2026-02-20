@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
         # Tags Area (Scrollable Flow Layout)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff) # Disable horizontal scroll to force wrap
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.tags_container = FlowContainer()
         # Crucial for FlowLayout wrapping in QScrollArea: the container must expand horizontally, but have a fixed minimum to let it shrink properly
         self.tags_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
