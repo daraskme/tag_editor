@@ -1,0 +1,39 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Downloaded AI models / Caches
+*.onnx
+*.safetensors
+*.bin
+huggingface/
+.cache/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specifics
+*.csv 
+# (if you don't want selected_tags.csv to be committed, though it's small)
