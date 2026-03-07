@@ -115,9 +115,23 @@ class TagButton(QPushButton):
     def __init__(self, tag_text, parent=None):
         super().__init__(tag_text, parent) # type: ignore
         self.tag_text = tag_text
-        self.setStyleSheet("QPushButton { border-radius: 10px; background-color: #3498db; color: white; padding: 5px 10px; font-weight: bold; } QPushButton:hover { background-color: #e74c3c; }")
+        self.setStyleSheet("""
+            QPushButton { 
+                border-radius: 12px; 
+                background-color: #3e3e42; 
+                color: #cccccc; 
+                padding: 4px 12px; 
+                font-size: 11px;
+                border: 1px solid #444;
+            } 
+            QPushButton:hover { 
+                background-color: #e74c3c; 
+                color: white;
+                border: 1px solid #c0392b;
+            }
+        """)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Left click to remove, Right click to edit")
+        self.setToolTip("Click to remove | Right-click to edit")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
