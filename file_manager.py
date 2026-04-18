@@ -7,36 +7,34 @@ class FileManager:
     def __init__(self):
         self.folder_path = ""
         self.all_image_files = []
-        self.image_files = [] # This will hold filtered files
+        self.image_files = []
         self.current_index = -1
+        self._tag_counts_cache = None  # None means dirty
 
     def load_folder(self, path):
         self.folder_path = path
         self.all_image_files = []
-        
+        self._tag_counts_cache = None
+
         if not os.path.exists(path):
             return
 
-        # Escape path for glob to handle special characters like '[' or ']'
         escaped_path = glob.escape(path)
-        
-        # Get all files and filter by supported extensions strictly
         all_files = glob.glob(os.path.join(escaped_path, "*"))
         for file in all_files:
             ext = os.path.splitext(file)[1].lower()
             if ext in SUPPORTED_IMAGE_EXTS:
                 self.all_image_files.append(file)
-        
+
         self.all_image_files.sort()
         self.image_files = list(self.all_image_files)
-        
+
         if self.image_files:
             self.current_index = 0
         else:
             self.current_index = -1
 
     def apply_filter(self, query):
-        """Filter images by tag query (case-insensitive)"""
         if not query:
             self.image_files = list(self.all_image_files)
         else:
@@ -55,13 +53,22 @@ class FileManager:
         return len(self.image_files)
 
     def get_all_unique_tags(self):
-        """Aggregate all tags from all files in the current folder for autocomplete"""
         unique_tags = set()
         for img_path in self.all_image_files:
-            tags = self.read_tags(img_path)
-            for tag in tags:
+            for tag in self.read_tags(img_path):
                 unique_tags.add(tag)
         return sorted(list(unique_tags))
+
+    def get_tag_counts(self):
+        """Returns cached list of (tag, count) sorted by count desc then alphabetically."""
+        if self._tag_counts_cache is not None:
+            return self._tag_counts_cache
+        counts = {}
+        for img_path in self.all_image_files:
+            for tag in self.read_tags(img_path):
+                counts[tag] = counts.get(tag, 0) + 1
+        self._tag_counts_cache = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+        return self._tag_counts_cache
 
     def get_current_image_path(self):
         if 0 <= self.current_index < len(self.image_files):
@@ -78,14 +85,12 @@ class FileManager:
         txt_path = self.get_text_file_path(image_path)
         if not txt_path or not os.path.exists(txt_path):
             return []
-        
         try:
             with open(txt_path, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
                 if not content:
                     return []
-                tags = [tag.strip() for tag in content.split(',') if tag.strip()]
-                return tags
+                return [tag.strip() for tag in content.split(',') if tag.strip()]
         except Exception:
             return []
 
@@ -93,10 +98,10 @@ class FileManager:
         txt_path = self.get_text_file_path(image_path)
         if not txt_path or os.path.isdir(txt_path):
             return False
-            
         try:
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write(", ".join(tags))
+            self._tag_counts_cache = None  # invalidate cache
             return True
         except Exception:
             return False
