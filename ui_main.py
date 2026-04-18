@@ -8,12 +8,10 @@ from PyQt6.QtWidgets import (
     QLabel, QSplitter, QScrollArea, QLineEdit, QFileDialog, QMessageBox,
     QMenuBar, QInputDialog, QSizePolicy, QComboBox, QProgressBar,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QDialog, QSpinBox, QTextEdit, QApplication,
 )
 from ui_components import FlowLayout, TagButton, ClickableImageLabel, FlowContainer
 from file_manager import FileManager
 from ai_tagger import PixAITaggerWorker, Florence2Worker, BatchPixAITaggerWorker, BatchFlorence2Worker
-from lora_utils import categorize_tags
 
 COLORS = {
     "bg": "#1e1e1e",
@@ -39,122 +37,6 @@ class NumericTableWidgetItem(QTableWidgetItem):
         except ValueError:
             return super().__lt__(other)
 
-
-class LoRATriggerDialog(QDialog):
-    """Dialog for generating categorized LoRA trigger word lists."""
-
-    CATEGORIES = [
-        ("trigger",       "固有トリガー (Trigger Words)"),
-        ("hair_head",     "髪・頭 (Hair & Head)"),
-        ("clothing_body", "服・身体 (Clothing & Body)"),
-        ("feet_shoes",    "足・靴 (Feet & Shoes)"),
-        ("general",       "汎用タグ (General)"),
-    ]
-
-    def __init__(self, file_manager: FileManager, parent=None):
-        super().__init__(parent)
-        self.file_manager = file_manager
-        self.setWindowTitle("LoRA Trigger List Generator")
-        self.resize(720, 580)
-        self._setup_ui()
-        self._generate()
-
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-
-        # Settings bar
-        settings_row = QHBoxLayout()
-        settings_row.addWidget(QLabel("最低出現枚数 (Min. appearances):"))
-        self.min_count_spin = QSpinBox()
-        self.min_count_spin.setMinimum(1)
-        self.min_count_spin.setMaximum(99999)
-        self.min_count_spin.setValue(1)
-        self.min_count_spin.setFixedWidth(70)
-        settings_row.addWidget(self.min_count_spin)
-
-        gen_btn = QPushButton("Generate")
-        gen_btn.setStyleSheet(f"background-color: {COLORS['primary']}; color: white; font-weight: bold; padding: 5px 14px;")
-        gen_btn.clicked.connect(self._generate)
-        settings_row.addWidget(gen_btn)
-        settings_row.addStretch()
-        layout.addLayout(settings_row)
-
-        # Category tabs
-        self.cat_tabs = QTabWidget()
-        self.text_areas: dict[str, QTextEdit] = {}
-
-        for key, label in self.CATEGORIES:
-            tab = QWidget()
-            tab_layout = QVBoxLayout(tab)
-            tab_layout.setContentsMargins(6, 6, 6, 6)
-
-            text_area = QTextEdit()
-            text_area.setPlaceholderText("タグがここに表示されます...")
-            text_area.setStyleSheet(f"""
-                QTextEdit {{
-                    background-color: {COLORS['sidebar']};
-                    color: {COLORS['text']};
-                    border: 1px solid #444;
-                    border-radius: 4px;
-                    font-size: 12px;
-                }}
-            """)
-            tab_layout.addWidget(text_area)
-
-            copy_btn = QPushButton(f"Copy {label.split('(')[1].rstrip(')')}")
-            copy_btn.setStyleSheet(f"background-color: {COLORS['inactive']}; color: white; padding: 4px 10px;")
-            copy_btn.clicked.connect(lambda checked, ta=text_area: self._copy_text(ta))
-            tab_layout.addWidget(copy_btn)
-
-            self.text_areas[key] = text_area
-            self.cat_tabs.addTab(tab, label)
-
-        layout.addWidget(self.cat_tabs, stretch=1)
-
-        # Bottom buttons
-        btn_row = QHBoxLayout()
-        export_btn = QPushButton("Export All to File...")
-        export_btn.setStyleSheet(f"background-color: {COLORS['accent']}; color: white; font-weight: bold; padding: 6px 14px;")
-        export_btn.clicked.connect(self._export_all)
-        btn_row.addWidget(export_btn)
-        btn_row.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.setStyleSheet(f"background-color: {COLORS['inactive']}; color: white; padding: 6px 14px;")
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
-
-    def _generate(self):
-        min_count = self.min_count_spin.value()
-        tag_counts = self.file_manager.get_tag_counts()
-        filtered = [tag for tag, count in tag_counts if count >= min_count]
-        categorized = categorize_tags(filtered)
-        for key, _ in self.CATEGORIES:
-            tags = categorized.get(key, [])
-            self.text_areas[key].setPlainText(", ".join(tags))
-
-    def _copy_text(self, text_area: QTextEdit):
-        text = text_area.toPlainText()
-        if text:
-            QApplication.clipboard().setText(text)
-
-    def _export_all(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export LoRA Trigger List", "lora_trigger_list.txt", "Text Files (*.txt)"
-        )
-        if not path:
-            return
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                for key, label in self.CATEGORIES:
-                    text = self.text_areas[key].toPlainText().strip()
-                    f.write(f"=== {label} ===\n")
-                    f.write(text if text else "(none)")
-                    f.write("\n\n")
-            QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", str(e))
 
 
 class MainWindow(QMainWindow):
@@ -426,12 +308,6 @@ class MainWindow(QMainWindow):
         self.clear_all_btn.clicked.connect(self.clear_current_tags)
         image_tab_layout.addWidget(self.clear_all_btn)
 
-        # LoRA trigger list button
-        lora_btn = QPushButton("🎯 Generate LoRA Trigger List")
-        lora_btn.setStyleSheet(f"background-color: {COLORS['accent']}; color: white; font-weight: bold; padding: 7px;")
-        lora_btn.clicked.connect(self.open_lora_dialog)
-        image_tab_layout.addWidget(lora_btn)
-
         self.tags_tab_widget.addTab(image_tab, "Image Tags")
 
         # ── Tab 2: All Tags ──────────────────────────────────────────────────
@@ -477,12 +353,6 @@ class MainWindow(QMainWindow):
         )
         self.remove_selected_btn.clicked.connect(self._remove_selected_tags)
         all_tab_layout.addWidget(self.remove_selected_btn)
-
-        # LoRA button also on All Tags tab for convenience
-        lora_btn2 = QPushButton("🎯 Generate LoRA Trigger List")
-        lora_btn2.setStyleSheet(f"background-color: {COLORS['accent']}; color: white; font-weight: bold; padding: 7px;")
-        lora_btn2.clicked.connect(self.open_lora_dialog)
-        all_tab_layout.addWidget(lora_btn2)
 
         self.tags_tab_widget.addTab(all_tab, "All Tags")
 
@@ -753,15 +623,6 @@ class MainWindow(QMainWindow):
                     self.all_tags_table.removeRow(r)
                     break
         self.all_tags_table.setSortingEnabled(True)
-
-    # ── LoRA Dialog ───────────────────────────────────────────────────────────
-
-    def open_lora_dialog(self):
-        if not self.file_manager.all_image_files:
-            QMessageBox.warning(self, "Warning", "No images loaded. Please open a folder first.")
-            return
-        dlg = LoRATriggerDialog(self.file_manager, parent=self)
-        dlg.exec()
 
     # ── AI Tagging ────────────────────────────────────────────────────────────
 
