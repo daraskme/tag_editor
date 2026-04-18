@@ -457,11 +457,10 @@ class MainWindow(QMainWindow):
         all_tab_layout.addLayout(all_search_layout)
 
         self.all_tags_table = QTableWidget()
-        self.all_tags_table.setColumnCount(3)
-        self.all_tags_table.setHorizontalHeaderLabels(["Tag", "Images", "Action"])
+        self.all_tags_table.setColumnCount(2)
+        self.all_tags_table.setHorizontalHeaderLabels(["Tag", "Images"])
         self.all_tags_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.all_tags_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.all_tags_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.all_tags_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.all_tags_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.all_tags_table.setSortingEnabled(True)
@@ -471,6 +470,13 @@ class MainWindow(QMainWindow):
             "QTableWidget { alternate-background-color: #252526; }"
         )
         all_tab_layout.addWidget(self.all_tags_table, stretch=1)
+
+        self.remove_selected_btn = QPushButton("🗑 Remove Selected Tag from All Files")
+        self.remove_selected_btn.setStyleSheet(
+            f"background-color: {COLORS['danger']}; color: white; font-weight: bold; padding: 7px;"
+        )
+        self.remove_selected_btn.clicked.connect(self._remove_selected_tags)
+        all_tab_layout.addWidget(self.remove_selected_btn)
 
         # LoRA button also on All Tags tab for convenience
         lora_btn2 = QPushButton("🎯 Generate LoRA Trigger List")
@@ -712,30 +718,41 @@ class MainWindow(QMainWindow):
             count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.all_tags_table.setItem(row, 1, count_item)
 
-            remove_btn = QPushButton("Remove from All")
-            remove_btn.setStyleSheet(
-                f"background-color: {COLORS['danger']}; color: white; "
-                f"padding: 2px 8px; border-radius: 3px; font-size: 11px;"
-            )
-            remove_btn.clicked.connect(lambda checked, t=tag: self._remove_tag_from_all_direct(t))
-            self.all_tags_table.setCellWidget(row, 2, remove_btn)
-
         self.all_tags_table.setSortingEnabled(True)
-        # Default sort: count descending
         self.all_tags_table.sortByColumn(1, Qt.SortOrder.DescendingOrder)
 
-    def _remove_tag_from_all_direct(self, tag: str):
-        total = len(self.file_manager.all_image_files)
+    def _remove_selected_tags(self):
+        selected_rows = self.all_tags_table.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Warning", "削除するタグを選択してください。")
+            return
+
+        tags = [self.all_tags_table.item(idx.row(), 0).text() for idx in selected_rows]
+        tag_list = ", ".join(f"'{t}'" for t in tags)
         reply = QMessageBox.question(
             self, "Confirm",
-            f"Remove '{tag}' from all {total} text files?",
+            f"全ファイルから {tag_list} を削除しますか？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            count = self.file_manager.remove_tag_from_all(tag)
-            self.statusBar().showMessage(f"Removed '{tag}' from {count} files.", 3000)
-            self.load_tags()
-            self.refresh_all_tags_table()
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        total_removed = 0
+        for tag in tags:
+            total_removed += self.file_manager.remove_tag_from_all(tag)
+
+        self.statusBar().showMessage(f"{len(tags)}個のタグを削除しました。({total_removed}件のファイルを更新)", 3000)
+        self.load_tags()
+
+        # Remove deleted rows from table without full rebuild
+        self.all_tags_table.setSortingEnabled(False)
+        for tag in tags:
+            for r in range(self.all_tags_table.rowCount() - 1, -1, -1):
+                item = self.all_tags_table.item(r, 0)
+                if item and item.text() == tag:
+                    self.all_tags_table.removeRow(r)
+                    break
+        self.all_tags_table.setSortingEnabled(True)
 
     # ── LoRA Dialog ───────────────────────────────────────────────────────────
 
