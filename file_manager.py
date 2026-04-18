@@ -63,6 +63,15 @@ class FileManager:
                 unique_tags.add(tag)
         return sorted(list(unique_tags))
 
+    def get_tag_counts(self):
+        """Returns list of (tag, count) sorted by count desc then alphabetically.
+        count = number of images that contain the tag."""
+        counts = {}
+        for img_path in self.all_image_files:
+            for tag in self.read_tags(img_path):
+                counts[tag] = counts.get(tag, 0) + 1
+        return sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+
     def get_current_image_path(self):
         if 0 <= self.current_index < len(self.image_files):
             return self.image_files[self.current_index]
