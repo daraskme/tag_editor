@@ -39,7 +39,8 @@ python -m pip install PyQt6 Pillow huggingface-hub einops timm opencv-python onn
 python -m pip install dghs-imgutils --no-deps -q
 python -m pip install hbutils hfutils cheeseshop deprecation requests tqdm -c "%~dp0pip_constraints.txt" -q
 python -m pip install pandas scikit-learn scipy shapely --only-binary :all: -c "%~dp0pip_constraints.txt" -q
-python -m pip install "emoji<2.12,>=2.5.0" piexif pilmoji pyclipper pyrfc6266 urlobject bchlib -c "%~dp0pip_constraints.txt" -q
+python -m pip install "emoji<2.12,>=2.5.0" piexif pyrfc6266 urlobject -c "%~dp0pip_constraints.txt" -q
+python -m pip install pilmoji pyclipper bchlib --only-binary :all: -c "%~dp0pip_constraints.txt" -q 2>nul
 python -m pip install opencv-contrib-python --only-binary :all: -c "%~dp0pip_constraints.txt" -q
 python -m pip install torch --only-binary :all: -c "%~dp0pip_constraints.txt" -q
 python -m pip install transformers -c "%~dp0pip_constraints.txt" -q
