@@ -31,8 +31,9 @@ echo [REPAIR] Setup complete!
 
 :check_deps
 echo [INFO] Checking dependencies...
-python -m pip install -r requirements.txt -q --exists-action i 2>nul
-python -m pip install PyQt6 Pillow -q
+python -m pip install PyQt6 Pillow dghs-imgutils huggingface-hub einops timm opencv-python onnxruntime-directml -q
+python -m pip install torch -q
+python -m pip install transformers -q
 
 :start_app
 echo Starting AI Tag Editor...
