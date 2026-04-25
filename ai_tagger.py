@@ -45,12 +45,15 @@ class PixAITaggerWorker(QThread):
 
         try:
             self.progress.emit(f"Running inference on {device_name}...")
-            from imgutils.tagging.pixai import get_pixai_tags
+            try:
+                from imgutils.tagging import get_pixai_tags
+            except ImportError:
+                from imgutils.tagging.pixai import get_pixai_tags
             import inspect
-            
+
             sig = inspect.signature(get_pixai_tags)
             params = sig.parameters
-            
+
             tagger_kwargs = {"model_name": self.model_name}
             if "threshold" in params:
                 tagger_kwargs["threshold"] = self.threshold
@@ -60,8 +63,8 @@ class PixAITaggerWorker(QThread):
             general_tags, character_tags = get_pixai_tags(self.image_path, **tagger_kwargs)
             result_tags = list(character_tags.keys()) + list(general_tags.keys())
             self.finished.emit(result_tags, "")
-        except (ImportError, TypeError):
-            print("PixAI module not found or incompatible. Falling back to SwinV2...")
+        except Exception as e:
+            print(f"PixAI failed ({type(e).__name__}: {e}). Falling back to SwinV2...")
             try:
                 from imgutils.tagging import get_wd14_tags
                 general_tags, character_tags = get_wd14_tags(
@@ -70,11 +73,9 @@ class PixAITaggerWorker(QThread):
                 )
                 result_tags = list(character_tags.keys()) + list(general_tags.keys())
                 self.finished.emit(result_tags, "")
-            except Exception as e:
-                self.finished.emit([], str(e))
-        except Exception as e:
-            traceback.print_exc()
-            self.finished.emit([], str(e))
+            except Exception as e2:
+                traceback.print_exc()
+                self.finished.emit([], str(e2))
 
 class BatchPixAITaggerWorker(QThread):
     progress = pyqtSignal(int, int, str)
@@ -98,11 +99,15 @@ class BatchPixAITaggerWorker(QThread):
         use_fallback = False
         
         try:
-            from imgutils.tagging.pixai import get_pixai_tags
+            try:
+                from imgutils.tagging import get_pixai_tags
+            except ImportError:
+                from imgutils.tagging.pixai import get_pixai_tags
             import inspect
             sig = inspect.signature(get_pixai_tags)
             params = sig.parameters
-        except ImportError:
+        except Exception as e:
+            print(f"PixAI import failed ({type(e).__name__}: {e}). Using SwinV2.")
             use_fallback = True
             from imgutils.tagging import get_wd14_tags
 
