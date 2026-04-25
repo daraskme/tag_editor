@@ -15,7 +15,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if exist "venv\.repaired_v5" goto :start_app
+if exist "venv\.repaired_v5" goto :check_deps
 
 echo [REPAIR] Starting environment fix (First time only - DirectML transition)...
 python -m pip install --upgrade pip
@@ -28,6 +28,13 @@ echo [REPAIR] Installing remaining dependencies...
 python -m pip install -r requirements.txt
 echo done > "venv\.repaired_v5"
 echo [REPAIR] Setup complete!
+
+:check_deps
+python -c "import PyQt6" 2>nul
+if errorlevel 1 (
+    echo [INFO] PyQt6 not found. Installing missing dependencies...
+    python -m pip install -r requirements.txt
+)
 
 :start_app
 echo Starting AI Tag Editor...
