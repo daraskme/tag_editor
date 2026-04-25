@@ -31,7 +31,8 @@ echo [REPAIR] Setup complete!
 
 :check_deps
 echo [INFO] Checking dependencies...
-python -m pip install -r requirements.txt -q --exists-action i
+python -m pip install -r requirements.txt -q --exists-action i 2>nul
+python -m pip install PyQt6 Pillow -q
 
 :start_app
 echo Starting AI Tag Editor...
