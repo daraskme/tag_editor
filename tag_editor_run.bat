@@ -33,15 +33,16 @@ echo [REPAIR] Setup complete!
 :check_deps
 echo [INFO] Checking dependencies...
 python -m pip install --upgrade pip -q
+echo numpy^>=2.0.0 > "%~dp0pip_constraints.txt"
 python -m pip install "numpy>=2.0.0" --only-binary :all: --no-cache-dir -q
-python -m pip install PyQt6 Pillow huggingface-hub einops timm opencv-python onnxruntime-directml --only-binary :all: -q
+python -m pip install PyQt6 Pillow huggingface-hub einops timm opencv-python onnxruntime-directml --only-binary :all: -c "%~dp0pip_constraints.txt" -q
 python -m pip install dghs-imgutils --no-deps -q
-python -m pip install hbutils hfutils cheeseshop deprecation requests tqdm -q
-python -m pip install pandas scikit-learn scipy shapely --only-binary :all: -q
-python -m pip install "emoji<2.12,>=2.5.0" piexif pilmoji pyclipper pyrfc6266 urlobject bchlib -q
-python -m pip install opencv-contrib-python --only-binary :all: -q
-python -m pip install torch --only-binary :all: -q
-python -m pip install transformers -q
+python -m pip install hbutils hfutils cheeseshop deprecation requests tqdm -c "%~dp0pip_constraints.txt" -q
+python -m pip install pandas scikit-learn scipy shapely --only-binary :all: -c "%~dp0pip_constraints.txt" -q
+python -m pip install "emoji<2.12,>=2.5.0" piexif pilmoji pyclipper pyrfc6266 urlobject bchlib -c "%~dp0pip_constraints.txt" -q
+python -m pip install opencv-contrib-python --only-binary :all: -c "%~dp0pip_constraints.txt" -q
+python -m pip install torch --only-binary :all: -c "%~dp0pip_constraints.txt" -q
+python -m pip install transformers -c "%~dp0pip_constraints.txt" -q
 
 :start_app
 echo Starting AI Tag Editor...
