@@ -35,6 +35,7 @@ set PYQT_ERR=%ERRORLEVEL%
 if not %PYQT_ERR%==0 (
     echo [INFO] PyQt6 not found or broken. Installing missing dependencies...
     python -m pip install -r requirements.txt
+    python -m pip install PyQt6
 )
 
 :start_app
