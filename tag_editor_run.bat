@@ -36,7 +36,10 @@ python -m pip install --upgrade pip -q
 python -m pip install "numpy>=2.0.0" --only-binary :all: --no-cache-dir -q
 python -m pip install PyQt6 Pillow huggingface-hub einops timm opencv-python onnxruntime-directml --only-binary :all: -q
 python -m pip install dghs-imgutils --no-deps -q
-python -m pip install hbutils cheeseshop deprecation requests tqdm -q
+python -m pip install hbutils hfutils cheeseshop deprecation requests tqdm -q
+python -m pip install pandas scikit-learn scipy shapely --only-binary :all: -q
+python -m pip install "emoji<2.12,>=2.5.0" piexif pilmoji pyclipper pyrfc6266 urlobject bchlib -q
+python -m pip install opencv-contrib-python --only-binary :all: -q
 python -m pip install torch --only-binary :all: -q
 python -m pip install transformers -q
 
