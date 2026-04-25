@@ -30,8 +30,9 @@ echo done > "venv\.repaired_v5"
 echo [REPAIR] Setup complete!
 
 :check_deps
-python -c "from PyQt6.QtWidgets import QApplication" 2>nul
-if errorlevel 1 (
+python -c "from PyQt6.QtWidgets import QApplication" >nul 2>&1
+set PYQT_ERR=%ERRORLEVEL%
+if not %PYQT_ERR%==0 (
     echo [INFO] PyQt6 not found or broken. Installing missing dependencies...
     python -m pip install -r requirements.txt
 )
