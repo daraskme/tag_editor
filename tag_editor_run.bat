@@ -31,7 +31,9 @@ echo [REPAIR] Setup complete!
 
 :check_deps
 echo [INFO] Checking dependencies...
-python -m pip install PyQt6 Pillow dghs-imgutils huggingface-hub einops timm opencv-python onnxruntime-directml -q
+python -m pip install "numpy>=2.0.0" -q
+python -m pip install PyQt6 Pillow huggingface-hub einops timm opencv-python onnxruntime-directml -q
+python -m pip install dghs-imgutils -q
 python -m pip install torch -q
 python -m pip install transformers -q
 
