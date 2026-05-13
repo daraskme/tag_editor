@@ -1,42 +1,30 @@
 import os
 import csv
 import json
+import time
 import traceback
-import sys
 import threading
+
 from PyQt6.QtCore import QThread, pyqtSignal
 from PIL import Image, ImageOps
+
+
+# ── Device / ONNX Runtime providers ──────────────────────────────────────────
 
 def get_onnx_device():
     try:
         import onnxruntime as rt
-        available_providers = rt.get_available_providers()
-        if 'CUDAExecutionProvider' in available_providers:
-            return "GPU (CUDA)", available_providers
-        elif 'DmlExecutionProvider' in available_providers:
-            return "GPU (DirectML)", available_providers
-        else:
-            return "CPU", available_providers
+        available = rt.get_available_providers()
+        if 'CUDAExecutionProvider' in available:
+            return "GPU (CUDA)", available
+        if 'DmlExecutionProvider' in available:
+            return "GPU (DirectML)", available
+        return "CPU", available
     except ImportError:
         return None, []
 
-def get_torch_device():
-    try:
-        import torch
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except ImportError:
-        return "cpu"
 
-
-# ── OppaiOracle helpers ──────────────────────────────────────────────────────
-
-OPPAI_REPO_ID = "Grio43/OppaiOracle"
-OPPAI_BASE_URL = f"https://huggingface.co/{OPPAI_REPO_ID}/resolve/main"
-_oppai_cache = {}
-_oppai_cache_lock = threading.Lock()
-
-
-def _oppai_select_providers():
+def _select_providers():
     import onnxruntime as ort
     available = set(ort.get_available_providers())
     providers = []
@@ -48,11 +36,13 @@ def _oppai_select_providers():
     return providers
 
 
-def _oppai_cache_dir(model_variant):
-    root = os.environ.get("OPPAI_CACHE_DIR") or os.path.join(
-        os.path.expanduser("~"), ".cache", "oppai_oracle"
+# ── Download / cache helpers (shared) ────────────────────────────────────────
+
+def _cache_dir(subpath):
+    root = os.environ.get("AI_TAGGER_CACHE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "ai_tagger"
     )
-    out = os.path.join(root, f"{model_variant}_onnx")
+    out = os.path.join(root, subpath)
     os.makedirs(out, exist_ok=True)
     return out
 
@@ -69,8 +59,7 @@ def _stream_download(url, dest, progress_cb=None, label=None, max_retries=5):
             headers["Range"] = f"bytes={resume_pos}-"
         try:
             with requests.get(url, stream=True, headers=headers, timeout=(30, 60)) as r:
-                if r.status_code in (416,):
-                    # already complete
+                if r.status_code == 416:
                     break
                 r.raise_for_status()
                 content_length = int(r.headers.get("Content-Length", 0))
@@ -101,23 +90,41 @@ def _stream_download(url, dest, progress_cb=None, label=None, max_retries=5):
                 progress_cb(f"Download {label} interrupted ({e}); retrying {attempt}/{max_retries}...")
             if attempt == max_retries:
                 raise
-            import time
             time.sleep(min(2 ** attempt, 10))
 
     os.replace(tmp, dest)
 
 
-def _oppai_download_files(model_variant, progress_cb=None):
-    cache = _oppai_cache_dir(model_variant)
+def _ensure_files(cache_dir, base_url, filenames, progress_cb=None, label_prefix=""):
     paths = {}
-    for fname in ("model.onnx", "vocabulary.json", "preprocessing.json"):
-        dest = os.path.join(cache, fname)
+    for fname in filenames:
+        dest = os.path.join(cache_dir, fname)
         if not os.path.exists(dest) or os.path.getsize(dest) == 0:
-            url = f"{OPPAI_BASE_URL}/{model_variant}_onnx/{fname}"
-            _stream_download(url, dest, progress_cb=progress_cb,
-                             label=f"{model_variant}/{fname}")
+            _stream_download(
+                f"{base_url}/{fname}", dest,
+                progress_cb=progress_cb, label=f"{label_prefix}{fname}",
+            )
         paths[fname] = dest
     return paths
+
+
+def _composite_rgb(img, background_color):
+    """Flatten RGBA/LA/transparent images onto a solid background.
+    Returns (rgb_image, was_composited)."""
+    if img.mode in ('RGBA', 'LA') or 'transparency' in img.info:
+        background = Image.new('RGB', img.size, background_color)
+        rgba = img.convert('RGBA')
+        background.paste(rgba.convert('RGB'), mask=rgba.getchannel('A'))
+        return background, True
+    return img.convert('RGB'), False
+
+
+# ── OppaiOracle (Grio43/OppaiOracle) ─────────────────────────────────────────
+
+OPPAI_REPO_ID = "Grio43/OppaiOracle"
+OPPAI_BASE_URL = f"https://huggingface.co/{OPPAI_REPO_ID}/resolve/main"
+_oppai_cache = {}
+_oppai_cache_lock = threading.Lock()
 
 
 def _oppai_load(model_variant="V1.1", progress_cb=None):
@@ -125,106 +132,97 @@ def _oppai_load(model_variant="V1.1", progress_cb=None):
         if model_variant in _oppai_cache:
             return _oppai_cache[model_variant]
 
-    files = _oppai_download_files(model_variant, progress_cb)
+    cache = _cache_dir(f"oppai_oracle/{model_variant}_onnx")
+    base = f"{OPPAI_BASE_URL}/{model_variant}_onnx"
+    files = _ensure_files(
+        cache, base,
+        ("model.onnx", "vocabulary.json", "preprocessing.json"),
+        progress_cb=progress_cb, label_prefix=f"{model_variant}/",
+    )
 
     if progress_cb:
         progress_cb(f"Loading OppaiOracle {model_variant} ONNX session...")
     import onnxruntime as ort
-    session = ort.InferenceSession(files["model.onnx"], providers=_oppai_select_providers())
+    session = ort.InferenceSession(files["model.onnx"], providers=_select_providers())
 
     with open(files["vocabulary.json"], "r", encoding="utf-8") as f:
         vocab_data = json.load(f)
     tag_to_index = vocab_data.get("tag_to_index", vocab_data)
     index_to_tag = {int(idx): tag for tag, idx in tag_to_index.items()}
-    pad_idx = int(tag_to_index.get("<PAD>", 0))
-    unk_idx = int(tag_to_index.get("<UNK>", 1))
 
     with open(files["preprocessing.json"], "r", encoding="utf-8") as f:
         pp = json.load(f)
-    image_size = int(pp.get("image_size", 448))
-    mean = pp.get("normalize_mean", [0.5, 0.5, 0.5])
-    std = pp.get("normalize_std", [0.5, 0.5, 0.5])
-    pad_color = tuple(pp.get("pad_color_rgb", [114, 114, 114]))
 
     input_names = [i.name for i in session.get_inputs()]
-    has_mask_input = "padding_mask" in input_names
-    primary_input = input_names[0]
-
     bundle = {
         "session": session,
         "index_to_tag": index_to_tag,
-        "pad_idx": pad_idx,
-        "unk_idx": unk_idx,
-        "image_size": image_size,
-        "mean": mean,
-        "std": std,
-        "pad_color": pad_color,
-        "primary_input": primary_input,
-        "has_mask_input": has_mask_input,
+        "pad_idx": int(tag_to_index.get("<PAD>", 0)),
+        "unk_idx": int(tag_to_index.get("<UNK>", 1)),
+        "image_size": int(pp.get("image_size", 448)),
+        "mean": pp.get("normalize_mean", [0.5, 0.5, 0.5]),
+        "std": pp.get("normalize_std", [0.5, 0.5, 0.5]),
+        "pad_color": tuple(pp.get("pad_color_rgb", [114, 114, 114])),
+        "primary_input": input_names[0],
+        "has_mask_input": "padding_mask" in input_names,
     }
-
     with _oppai_cache_lock:
         _oppai_cache[model_variant] = bundle
     return bundle
 
 
 def _oppai_preprocess(image_path, image_size, mean, std, pad_color):
+    """Letterbox-resize to image_size×image_size, padded with pad_color."""
     import numpy as np
-    was_composited = False
     with Image.open(image_path) as img:
         img.load()
         img = ImageOps.exif_transpose(img)
-        if img.mode in ('RGBA', 'LA') or 'transparency' in img.info:
-            was_composited = True
-            background = Image.new('RGB', img.size, pad_color)
-            img_rgba = img.convert('RGBA')
-            alpha = img_rgba.getchannel('A')
-            background.paste(img_rgba.convert('RGB'), mask=alpha)
-            img = background
-        else:
-            img = img.convert('RGB')
+        img, was_composited = _composite_rgb(img, pad_color)
         arr = np.asarray(img, dtype=np.uint8)
 
     h, w = arr.shape[:2]
-    target = image_size
-    scale = min(target / w, target / h, 1.0)
+    scale = min(image_size / w, image_size / h, 1.0)
     new_w = max(1, round(w * scale))
     new_h = max(1, round(h * scale))
     if new_w != w or new_h != h:
-        pil_img = Image.fromarray(arr).resize((new_w, new_h), Image.BILINEAR)
-        arr = np.asarray(pil_img, dtype=np.uint8)
+        arr = np.asarray(
+            Image.fromarray(arr).resize((new_w, new_h), Image.BILINEAR),
+            dtype=np.uint8,
+        )
 
-    canvas = np.full((target, target, 3), pad_color, dtype=np.uint8)
-    top = (target - new_h) // 2
-    left = (target - new_w) // 2
+    canvas = np.full((image_size, image_size, 3), pad_color, dtype=np.uint8)
+    top = (image_size - new_h) // 2
+    left = (image_size - new_w) // 2
     canvas[top:top + new_h, left:left + new_w] = arr
 
-    mask = np.ones((target, target), dtype=bool)
+    mask = np.ones((image_size, image_size), dtype=bool)
     mask[top:top + new_h, left:left + new_w] = False
 
     x = canvas.astype(np.float32) / 255.0
-    mean_arr = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
-    std_arr = np.array(std, dtype=np.float32).reshape(1, 1, 3)
-    x = (x - mean_arr) / std_arr
+    x = (x - np.array(mean, dtype=np.float32).reshape(1, 1, 3)) \
+        / np.array(std, dtype=np.float32).reshape(1, 1, 3)
     x = x.transpose(2, 0, 1)
     return np.expand_dims(x, axis=0), np.expand_dims(mask, axis=0), was_composited
+
+
+def _sigmoid_if_needed(scores):
+    import numpy as np
+    if scores.min() < 0.0 or scores.max() > 1.0:
+        scores = 1.0 / (1.0 + np.exp(-scores.astype(np.float64)))
+        return scores.astype(np.float32)
+    return scores
 
 
 def _oppai_infer(bundle, image_path, threshold, top_k):
     import numpy as np
     inp, padding_mask, was_composited = _oppai_preprocess(
-        image_path, bundle["image_size"], bundle["mean"], bundle["std"], bundle["pad_color"]
+        image_path, bundle["image_size"], bundle["mean"], bundle["std"], bundle["pad_color"],
     )
     feed = {bundle["primary_input"]: inp}
     if bundle["has_mask_input"]:
         feed["padding_mask"] = padding_mask
 
-    outputs = bundle["session"].run(None, feed)
-    scores = outputs[0][0]
-    # Output is sigmoid already for V1/V1.1; clip just in case for legacy.
-    if scores.min() < 0.0 or scores.max() > 1.0:
-        scores = 1.0 / (1.0 + np.exp(-scores.astype(np.float64)))
-        scores = scores.astype(np.float32)
+    scores = _sigmoid_if_needed(bundle["session"].run(None, feed)[0][0])
 
     idxs = np.argsort(scores)[::-1]
     pad_idx, unk_idx = bundle["pad_idx"], bundle["unk_idx"]
@@ -232,146 +230,203 @@ def _oppai_infer(bundle, image_path, threshold, top_k):
 
     tags = []
     for idx in idxs:
-        idx_int = int(idx)
         score = float(scores[idx])
         if score < threshold:
             break
+        idx_int = int(idx)
         if idx_int in (pad_idx, unk_idx):
             continue
-        tag_name = index_to_tag.get(idx_int)
-        if tag_name is None:
+        name = index_to_tag.get(idx_int)
+        if name is None:
             continue
-        if was_composited and tag_name == 'gray_background':
+        if was_composited and name == 'gray_background':
             continue
-        tags.append(tag_name)
+        tags.append(name)
         if len(tags) >= top_k:
             break
     return tags
 
-class PixAITaggerWorker(QThread):
-    finished = pyqtSignal(list, str) # tags, error_msg
-    progress = pyqtSignal(str)
 
-    def __init__(self, image_path, threshold=0.35):
-        super().__init__()
-        self.image_path = image_path
-        self.threshold = threshold
-        self.model_name = "v0.9"
+# ── PixAI Tagger v0.9 (deepghs/pixai-tagger-v0.9-onnx) ───────────────────────
 
-    def run(self):
-        print(f"--- Starting PixAI Tagger ---")
-        device_name, providers = get_onnx_device()
-        
-        if device_name is None:
-            self.finished.emit([], "ONNX Runtime not installed.")
-            return
+PIXAI_REPO_ID = "deepghs/pixai-tagger-v0.9-onnx"
+PIXAI_BASE_URL = f"https://huggingface.co/{PIXAI_REPO_ID}/resolve/main"
+PIXAI_GENERAL_CATEGORY = 0
+PIXAI_CHARACTER_CATEGORY = 4
+_pixai_cache = {}
+_pixai_cache_lock = threading.Lock()
 
-        try:
-            self.progress.emit(f"Running inference on {device_name}...")
-            try:
-                from imgutils.tagging import get_pixai_tags
-            except ImportError:
-                from imgutils.tagging.pixai import get_pixai_tags
-            import inspect
 
-            sig = inspect.signature(get_pixai_tags)
-            params = sig.parameters
+def _pixai_load(progress_cb=None):
+    with _pixai_cache_lock:
+        if "v0.9" in _pixai_cache:
+            return _pixai_cache["v0.9"]
 
-            tagger_kwargs = {"model_name": self.model_name}
-            if "threshold" in params:
-                tagger_kwargs["threshold"] = self.threshold
-            elif "thresholds" in params:
-                tagger_kwargs["thresholds"] = self.threshold
+    cache = _cache_dir("pixai_tagger/v0.9")
+    files = _ensure_files(
+        cache, PIXAI_BASE_URL,
+        ("model.onnx", "selected_tags.csv", "categories.json", "thresholds.csv"),
+        progress_cb=progress_cb, label_prefix="pixai/",
+    )
 
-            general_tags, character_tags = get_pixai_tags(self.image_path, **tagger_kwargs)
-            result_tags = list(character_tags.keys()) + list(general_tags.keys())
-            self.finished.emit(result_tags, "")
-        except Exception as e:
-            print(f"PixAI failed ({type(e).__name__}: {e}). Falling back to SwinV2...")
-            try:
-                from imgutils.tagging import get_wd14_tags
-                general_tags, character_tags = get_wd14_tags(
-                    self.image_path, model_name='SwinV2',
-                    general_threshold=self.threshold, character_threshold=self.threshold
-                )
-                result_tags = list(character_tags.keys()) + list(general_tags.keys())
-                self.finished.emit(result_tags, "")
-            except Exception as e2:
-                traceback.print_exc()
-                self.finished.emit([], str(e2))
+    if progress_cb:
+        progress_cb("Loading PixAI Tagger v0.9 ONNX session...")
+    import onnxruntime as ort
+    session = ort.InferenceSession(files["model.onnx"], providers=_select_providers())
 
-class BatchPixAITaggerWorker(QThread):
+    tag_names = []
+    tag_categories = []
+    with open(files["selected_tags.csv"], "r", encoding="utf-8", newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            tag_names.append(row["name"])
+            tag_categories.append(int(row["category"]))
+
+    default_thresholds = {}
+    with open(files["thresholds.csv"], "r", encoding="utf-8", newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            default_thresholds[int(row["category"])] = float(row["threshold"])
+
+    input_names = [i.name for i in session.get_inputs()]
+    bundle = {
+        "session": session,
+        "tag_names": tag_names,
+        "tag_categories": tag_categories,
+        "default_thresholds": default_thresholds,
+        "image_size": 448,
+        "primary_input": input_names[0],
+    }
+    with _pixai_cache_lock:
+        _pixai_cache["v0.9"] = bundle
+    return bundle
+
+
+def _pixai_preprocess(image_path, image_size):
+    """Stretch-resize to image_size×image_size, normalize to [-1, 1]."""
+    import numpy as np
+    with Image.open(image_path) as img:
+        img.load()
+        img = ImageOps.exif_transpose(img)
+        img, _ = _composite_rgb(img, (255, 255, 255))
+        img = img.resize((image_size, image_size), Image.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+
+    arr = (arr - 0.5) / 0.5
+    arr = arr.transpose(2, 0, 1)
+    return np.expand_dims(arr, axis=0)
+
+
+def _pixai_infer(bundle, image_path, threshold_general=None, threshold_character=None, top_k=None):
+    defaults = bundle["default_thresholds"]
+    if threshold_general is None:
+        threshold_general = defaults.get(PIXAI_GENERAL_CATEGORY, 0.3)
+    if threshold_character is None:
+        threshold_character = defaults.get(PIXAI_CHARACTER_CATEGORY, 0.85)
+
+    x = _pixai_preprocess(image_path, bundle["image_size"])
+    scores = _sigmoid_if_needed(bundle["session"].run(None, {bundle["primary_input"]: x})[0][0])
+
+    tag_names = bundle["tag_names"]
+    tag_categories = bundle["tag_categories"]
+
+    char_hits = []
+    general_hits = []
+    for idx, score in enumerate(scores):
+        cat = tag_categories[idx]
+        if cat == PIXAI_CHARACTER_CATEGORY and score >= threshold_character:
+            char_hits.append((float(score), idx))
+        elif cat == PIXAI_GENERAL_CATEGORY and score >= threshold_general:
+            general_hits.append((float(score), idx))
+
+    char_hits.sort(reverse=True)
+    general_hits.sort(reverse=True)
+
+    result = [tag_names[i] for _, i in char_hits] + [tag_names[i] for _, i in general_hits]
+    if top_k is not None:
+        result = result[:top_k]
+    return result
+
+
+# ── Worker classes ───────────────────────────────────────────────────────────
+
+def _merge_tags(file_manager, img_path, new_tags):
+    current = file_manager.read_tags(img_path)
+    added = False
+    for tag in new_tags:
+        if tag not in current:
+            current.append(tag)
+            added = True
+    if added:
+        file_manager.save_tags(img_path, current)
+
+
+class _BaseBatchTaggerWorker(QThread):
+    """Common scaffolding for batch taggers. Subclasses provide:
+       - LABEL (str): human-readable tagger name for status messages
+       - _load(progress_cb): warm up / download model, return a bundle
+       - _infer(bundle, image_path): return list[str] of tags for one image
+    """
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int, int, str)
 
-    def __init__(self, file_manager, image_paths, threshold=0.35):
+    LABEL = ""
+
+    def __init__(self, file_manager, image_paths):
         super().__init__()
         self.file_manager = file_manager
         self.image_paths = image_paths
-        self.threshold = threshold
-        self.model_name = "v0.9"
+
+    def _load(self, progress_cb=None):
+        raise NotImplementedError
+
+    def _infer(self, bundle, image_path):
+        raise NotImplementedError
 
     def run(self):
+        total = len(self.image_paths)
         device_name, _ = get_onnx_device()
         if device_name is None:
-            self.finished.emit(0, len(self.image_paths), "ONNX Runtime not installed.")
+            self.finished.emit(0, total, "ONNX Runtime not installed.")
+            return
+
+        try:
+            bundle = self._load()
+        except Exception as e:
+            traceback.print_exc()
+            self.finished.emit(0, total, str(e))
             return
 
         success_count = 0
-        total = len(self.image_paths)
-        use_fallback = False
-        
-        try:
-            try:
-                from imgutils.tagging import get_pixai_tags
-            except ImportError:
-                from imgutils.tagging.pixai import get_pixai_tags
-            import inspect
-            sig = inspect.signature(get_pixai_tags)
-            params = sig.parameters
-        except Exception as e:
-            print(f"PixAI import failed ({type(e).__name__}: {e}). Using SwinV2.")
-            use_fallback = True
-            from imgutils.tagging import get_wd14_tags
-
         for i, img_path in enumerate(self.image_paths):
-            if self.isInterruptionRequested(): break
+            if self.isInterruptionRequested():
+                break
             self.progress.emit(i, total, os.path.basename(img_path))
             try:
-                if not use_fallback:
-                    tagger_kwargs = {"model_name": self.model_name}
-                    if "threshold" in params:
-                        tagger_kwargs["threshold"] = self.threshold
-                    elif "thresholds" in params:
-                        tagger_kwargs["thresholds"] = self.threshold
-                        
-                    general_tags, character_tags = get_pixai_tags(img_path, **tagger_kwargs)
-                else:
-                    general_tags, character_tags = get_wd14_tags(img_path, model_name='SwinV2', general_threshold=self.threshold, character_threshold=self.threshold)
-                
-                new_tags = list(character_tags.keys()) + list(general_tags.keys())
-                current_tags = self.file_manager.read_tags(img_path)
-                added = False
-                for tag in new_tags:
-                    if tag not in current_tags:
-                        current_tags.append(tag)
-                        added = True
-                if added: self.file_manager.save_tags(img_path, current_tags)
+                new_tags = self._infer(bundle, img_path)
+                _merge_tags(self.file_manager, img_path, new_tags)
                 success_count += 1
-            except Exception as e:
-                print(f"Error: {e}")
+            except Exception:
+                traceback.print_exc()
         self.finished.emit(success_count, total, "")
 
-class OppaiOracleWorker(QThread):
+
+class _BaseSingleTaggerWorker(QThread):
+    """Common scaffolding for single-image taggers."""
     finished = pyqtSignal(list, str)
     progress = pyqtSignal(str)
 
-    def __init__(self, image_path, threshold=0.4, top_k=50, model_variant="V1.1"):
+    LABEL = ""
+
+    def __init__(self, image_path):
         super().__init__()
         self.image_path = image_path
-        self.threshold = threshold
-        self.top_k = top_k
-        self.model_variant = model_variant
+
+    def _load(self, progress_cb=None):
+        raise NotImplementedError
+
+    def _infer(self, bundle, image_path):
+        raise NotImplementedError
 
     def run(self):
         try:
@@ -379,57 +434,83 @@ class OppaiOracleWorker(QThread):
             if device_name is None:
                 self.finished.emit([], "ONNX Runtime not installed.")
                 return
-            self.progress.emit(f"Running OppaiOracle {self.model_variant} on {device_name}...")
-            bundle = _oppai_load(self.model_variant, progress_cb=self.progress.emit)
-            tags = _oppai_infer(bundle, self.image_path, self.threshold, self.top_k)
+            self.progress.emit(f"Running {self.LABEL} on {device_name}...")
+            bundle = self._load(progress_cb=self.progress.emit)
+            tags = self._infer(bundle, self.image_path)
             self.finished.emit(tags, "")
         except Exception as e:
             traceback.print_exc()
             self.finished.emit([], str(e))
 
 
-class BatchOppaiOracleWorker(QThread):
-    progress = pyqtSignal(int, int, str)
-    finished = pyqtSignal(int, int, str)
-
-    def __init__(self, file_manager, image_paths, threshold=0.4, top_k=50, model_variant="V1.1"):
-        super().__init__()
-        self.file_manager = file_manager
-        self.image_paths = image_paths
+class OppaiOracleWorker(_BaseSingleTaggerWorker):
+    def __init__(self, image_path, threshold=0.4, top_k=50, model_variant="V1.1"):
+        super().__init__(image_path)
         self.threshold = threshold
         self.top_k = top_k
         self.model_variant = model_variant
+        self.LABEL = f"OppaiOracle {model_variant}"
 
-    def run(self):
-        device_name, _ = get_onnx_device()
-        if device_name is None:
-            self.finished.emit(0, len(self.image_paths), "ONNX Runtime not installed.")
-            return
+    def _load(self, progress_cb=None):
+        return _oppai_load(self.model_variant, progress_cb=progress_cb)
 
-        try:
-            bundle = _oppai_load(self.model_variant)
-        except Exception as e:
-            traceback.print_exc()
-            self.finished.emit(0, len(self.image_paths), str(e))
-            return
+    def _infer(self, bundle, image_path):
+        return _oppai_infer(bundle, image_path, self.threshold, self.top_k)
 
-        success_count = 0
-        total = len(self.image_paths)
-        for i, img_path in enumerate(self.image_paths):
-            if self.isInterruptionRequested():
-                break
-            self.progress.emit(i, total, os.path.basename(img_path))
-            try:
-                new_tags = _oppai_infer(bundle, img_path, self.threshold, self.top_k)
-                current_tags = self.file_manager.read_tags(img_path)
-                added = False
-                for tag in new_tags:
-                    if tag not in current_tags:
-                        current_tags.append(tag)
-                        added = True
-                if added:
-                    self.file_manager.save_tags(img_path, current_tags)
-                success_count += 1
-            except Exception:
-                traceback.print_exc()
-        self.finished.emit(success_count, total, "")
+
+class BatchOppaiOracleWorker(_BaseBatchTaggerWorker):
+    def __init__(self, file_manager, image_paths, threshold=0.4, top_k=50, model_variant="V1.1"):
+        super().__init__(file_manager, image_paths)
+        self.threshold = threshold
+        self.top_k = top_k
+        self.model_variant = model_variant
+        self.LABEL = f"OppaiOracle {model_variant}"
+
+    def _load(self, progress_cb=None):
+        return _oppai_load(self.model_variant, progress_cb=progress_cb)
+
+    def _infer(self, bundle, image_path):
+        return _oppai_infer(bundle, image_path, self.threshold, self.top_k)
+
+
+class PixAITaggerWorker(_BaseSingleTaggerWorker):
+    LABEL = "PixAI Tagger v0.9"
+
+    def __init__(self, image_path, threshold_general=None, threshold_character=None, top_k=128):
+        super().__init__(image_path)
+        self.threshold_general = threshold_general
+        self.threshold_character = threshold_character
+        self.top_k = top_k
+
+    def _load(self, progress_cb=None):
+        return _pixai_load(progress_cb=progress_cb)
+
+    def _infer(self, bundle, image_path):
+        return _pixai_infer(
+            bundle, image_path,
+            threshold_general=self.threshold_general,
+            threshold_character=self.threshold_character,
+            top_k=self.top_k,
+        )
+
+
+class BatchPixAITaggerWorker(_BaseBatchTaggerWorker):
+    LABEL = "PixAI Tagger v0.9"
+
+    def __init__(self, file_manager, image_paths,
+                 threshold_general=None, threshold_character=None, top_k=128):
+        super().__init__(file_manager, image_paths)
+        self.threshold_general = threshold_general
+        self.threshold_character = threshold_character
+        self.top_k = top_k
+
+    def _load(self, progress_cb=None):
+        return _pixai_load(progress_cb=progress_cb)
+
+    def _infer(self, bundle, image_path):
+        return _pixai_infer(
+            bundle, image_path,
+            threshold_general=self.threshold_general,
+            threshold_character=self.threshold_character,
+            top_k=self.top_k,
+        )

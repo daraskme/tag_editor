@@ -1,9 +1,6 @@
 PyQt6
 Pillow
-numpy
-torch
+numpy>=2.0.0
 onnxruntime-directml>=1.20.0
 huggingface-hub
 requests
-dghs-imgutils>=0.13.0
-opencv-python

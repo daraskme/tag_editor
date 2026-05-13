@@ -11,7 +11,10 @@ from PyQt6.QtWidgets import (
 )
 from ui_components import FlowLayout, TagButton, ClickableImageLabel, FlowContainer
 from file_manager import FileManager
-from ai_tagger import PixAITaggerWorker, OppaiOracleWorker, BatchPixAITaggerWorker, BatchOppaiOracleWorker
+from ai_tagger import (
+    OppaiOracleWorker, BatchOppaiOracleWorker,
+    PixAITaggerWorker, BatchPixAITaggerWorker,
+)
 
 COLORS = {
     "bg": "#1e1e1e",
@@ -42,7 +45,7 @@ class NumericTableWidgetItem(QTableWidgetItem):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PixAI Tag Editor Premium")
+        self.setWindowTitle("AI Tag Editor")
         self.resize(1200, 800)
         self.file_manager = FileManager()
         self.tag_clipboard = []
@@ -221,17 +224,33 @@ class MainWindow(QMainWindow):
 
         # AI controls
         ai_layout = QVBoxLayout()
-        ai_single_layout = QHBoxLayout()
+
+        # Run buttons (single image)
+        run_btn_layout = QHBoxLayout()
         self.pixai_btn = QPushButton("Run PixAI Tagger")
         self.pixai_btn.setStyleSheet("background-color: #9b59b6; color: white; padding: 5px;")
         self.pixai_btn.clicked.connect(self.run_pixai_tagger)
         self.oppai_btn = QPushButton("Run OppaiOracle")
         self.oppai_btn.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
         self.oppai_btn.clicked.connect(self.run_oppai_oracle)
-        ai_single_layout.addWidget(self.pixai_btn)
-        ai_single_layout.addWidget(self.oppai_btn)
-        ai_layout.addLayout(ai_single_layout)
+        run_btn_layout.addWidget(self.pixai_btn)
+        run_btn_layout.addWidget(self.oppai_btn)
+        ai_layout.addLayout(run_btn_layout)
 
+        # PixAI options
+        pixai_opt_layout = QHBoxLayout()
+        pixai_opt_layout.addWidget(QLabel("PixAI Threshold — General:"))
+        self.pixai_general_threshold_edit = QLineEdit("0.3")
+        self.pixai_general_threshold_edit.setFixedWidth(50)
+        pixai_opt_layout.addWidget(self.pixai_general_threshold_edit)
+        pixai_opt_layout.addWidget(QLabel("Character:"))
+        self.pixai_character_threshold_edit = QLineEdit("0.85")
+        self.pixai_character_threshold_edit.setFixedWidth(50)
+        pixai_opt_layout.addWidget(self.pixai_character_threshold_edit)
+        pixai_opt_layout.addStretch(1)
+        ai_layout.addLayout(pixai_opt_layout)
+
+        # OppaiOracle options
         oppai_opt_layout = QHBoxLayout()
         oppai_opt_layout.addWidget(QLabel("OppaiOracle Model:"))
         self.oppai_model_combo = QComboBox()
@@ -244,16 +263,18 @@ class MainWindow(QMainWindow):
         oppai_opt_layout.addStretch(1)
         ai_layout.addLayout(oppai_opt_layout)
 
-        batch_ai_layout = QHBoxLayout()
+        # Batch buttons
+        batch_btn_layout = QHBoxLayout()
         self.batch_pixai_btn = QPushButton("Batch Tag All (PixAI)")
         self.batch_pixai_btn.setStyleSheet("background-color: #8e44ad; color: white; padding: 5px;")
         self.batch_pixai_btn.clicked.connect(self.run_batch_pixai)
         self.batch_oppai_btn = QPushButton("Batch Tag All (OppaiOracle)")
         self.batch_oppai_btn.setStyleSheet("background-color: #d35400; color: white; padding: 5px;")
         self.batch_oppai_btn.clicked.connect(self.run_batch_oppai)
-        batch_ai_layout.addWidget(self.batch_pixai_btn)
-        batch_ai_layout.addWidget(self.batch_oppai_btn)
-        ai_layout.addLayout(batch_ai_layout)
+        batch_btn_layout.addWidget(self.batch_pixai_btn)
+        batch_btn_layout.addWidget(self.batch_oppai_btn)
+        ai_layout.addLayout(batch_btn_layout)
+
         image_tab_layout.addLayout(ai_layout)
 
         # Batch progress (hidden by default)
@@ -629,97 +650,109 @@ class MainWindow(QMainWindow):
     # ── AI Tagging ────────────────────────────────────────────────────────────
 
     def set_ai_buttons_enabled(self, enabled: bool):
-        self.pixai_btn.setEnabled(enabled)
-        self.oppai_btn.setEnabled(enabled)
-        self.batch_pixai_btn.setEnabled(enabled)
-        self.batch_oppai_btn.setEnabled(enabled)
-        self.add_all_btn.setEnabled(enabled)
-        self.remove_all_btn.setEnabled(enabled)
+        for btn in (self.pixai_btn, self.oppai_btn,
+                    self.batch_pixai_btn, self.batch_oppai_btn,
+                    self.add_all_btn, self.remove_all_btn):
+            btn.setEnabled(enabled)
+
+    @staticmethod
+    def _parse_threshold(text: str, default: float) -> float:
+        try:
+            return max(0.0, min(1.0, float(text.strip())))
+        except ValueError:
+            return default
 
     def _get_oppai_threshold(self) -> float:
-        try:
-            val = float(self.oppai_threshold_edit.text().strip())
-            return max(0.0, min(1.0, val))
-        except ValueError:
-            return 0.4
+        return self._parse_threshold(self.oppai_threshold_edit.text(), 0.4)
+
+    def _get_pixai_thresholds(self) -> tuple:
+        return (
+            self._parse_threshold(self.pixai_general_threshold_edit.text(), 0.3),
+            self._parse_threshold(self.pixai_character_threshold_edit.text(), 0.85),
+        )
+
+    def _start_single_tagger(self, worker, label: str):
+        self.set_ai_buttons_enabled(False)
+        self.statusBar().showMessage(f"Initializing {label}...")
+        self._active_worker = worker  # keep a reference so it isn't GC'd
+        worker.progress.connect(self.update_status)
+        worker.finished.connect(self.on_ai_finished)
+        worker.start()
+
+    def _start_batch_tagger(self, worker, label: str):
+        if not self.file_manager.image_files:
+            QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
+            return False
+        reply = QMessageBox.question(
+            self, "Confirm",
+            f"Run {label} on all {len(self.file_manager.image_files)} images?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+
+        self.set_ai_buttons_enabled(False)
+        self.progress_bar.setVisible(True)
+        self.batch_status_label.setVisible(True)
+        self.cancel_batch_btn.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(self.file_manager.image_files))
+        self._active_batch_worker = worker
+        worker.progress.connect(self.update_batch_progress)
+        worker.finished.connect(self.on_batch_finished)
+        worker.start()
+        return True
 
     def run_pixai_tagger(self):
         img_path = self.file_manager.get_current_image_path()
         if not img_path:
             return
-        self.set_ai_buttons_enabled(False)
-        self.statusBar().showMessage("Initializing PixAI Tagger...")
-        self.pixai_worker = PixAITaggerWorker(img_path)
-        self.pixai_worker.progress.connect(self.update_status)
-        self.pixai_worker.finished.connect(self.on_ai_finished)
-        self.pixai_worker.start()
+        thr_general, thr_character = self._get_pixai_thresholds()
+        worker = PixAITaggerWorker(
+            img_path,
+            threshold_general=thr_general,
+            threshold_character=thr_character,
+        )
+        self._start_single_tagger(worker, "PixAI Tagger")
 
     def run_batch_pixai(self):
-        if not self.file_manager.image_files:
-            QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
-            return
-        reply = QMessageBox.question(self, "Confirm",
-                                     f"Run PixAI Tagger on all {len(self.file_manager.image_files)} images?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.set_ai_buttons_enabled(False)
-            self.progress_bar.setVisible(True)
-            self.batch_status_label.setVisible(True)
-            self.cancel_batch_btn.setVisible(True)
-            self.progress_bar.setValue(0)
-            self.progress_bar.setMaximum(len(self.file_manager.image_files))
-            self.batch_pixai_worker = BatchPixAITaggerWorker(self.file_manager, self.file_manager.image_files)
-            self.batch_pixai_worker.progress.connect(self.update_batch_progress)
-            self.batch_pixai_worker.finished.connect(self.on_batch_finished)
-            self.batch_pixai_worker.start()
+        thr_general, thr_character = self._get_pixai_thresholds()
+        worker = BatchPixAITaggerWorker(
+            self.file_manager, self.file_manager.image_files,
+            threshold_general=thr_general,
+            threshold_character=thr_character,
+        )
+        self._start_batch_tagger(worker, "PixAI Tagger")
 
     def run_oppai_oracle(self):
         img_path = self.file_manager.get_current_image_path()
         if not img_path:
             return
         variant = self.oppai_model_combo.currentText()
-        threshold = self._get_oppai_threshold()
-        self.set_ai_buttons_enabled(False)
-        self.statusBar().showMessage(f"Initializing OppaiOracle ({variant})...")
-        self.oppai_worker = OppaiOracleWorker(img_path, threshold=threshold, model_variant=variant)
-        self.oppai_worker.progress.connect(self.update_status)
-        self.oppai_worker.finished.connect(self.on_ai_finished)
-        self.oppai_worker.start()
+        worker = OppaiOracleWorker(
+            img_path,
+            threshold=self._get_oppai_threshold(),
+            model_variant=variant,
+        )
+        self._start_single_tagger(worker, f"OppaiOracle ({variant})")
 
     def run_batch_oppai(self):
-        if not self.file_manager.image_files:
-            QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
-            return
         variant = self.oppai_model_combo.currentText()
-        threshold = self._get_oppai_threshold()
-        reply = QMessageBox.question(self, "Confirm",
-                                     f"Run OppaiOracle ({variant}) on all {len(self.file_manager.image_files)} images?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.set_ai_buttons_enabled(False)
-            self.progress_bar.setVisible(True)
-            self.batch_status_label.setVisible(True)
-            self.cancel_batch_btn.setVisible(True)
-            self.progress_bar.setValue(0)
-            self.progress_bar.setMaximum(len(self.file_manager.image_files))
-            self.batch_oppai_worker = BatchOppaiOracleWorker(
-                self.file_manager, self.file_manager.image_files,
-                threshold=threshold, model_variant=variant,
-            )
-            self.batch_oppai_worker.progress.connect(self.update_batch_progress)
-            self.batch_oppai_worker.finished.connect(self.on_batch_finished)
-            self.batch_oppai_worker.start()
+        worker = BatchOppaiOracleWorker(
+            self.file_manager, self.file_manager.image_files,
+            threshold=self._get_oppai_threshold(),
+            model_variant=variant,
+        )
+        self._start_batch_tagger(worker, f"OppaiOracle ({variant})")
 
     def update_status(self, msg: str):
         self.statusBar().showMessage(msg)
 
     def cancel_batch(self):
-        if hasattr(self, "batch_pixai_worker") and self.batch_pixai_worker.isRunning():
-            self.batch_pixai_worker.requestInterruption()
-            self.statusBar().showMessage("Cancelling PixAI batch...")
-        if hasattr(self, "batch_oppai_worker") and self.batch_oppai_worker.isRunning():
-            self.batch_oppai_worker.requestInterruption()
-            self.statusBar().showMessage("Cancelling OppaiOracle batch...")
+        worker = getattr(self, "_active_batch_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            self.statusBar().showMessage("Cancelling batch...")
         self.cancel_batch_btn.setEnabled(False)
 
     def update_batch_progress(self, current: int, total: int, filename: str):
