@@ -24,7 +24,9 @@ def get_onnx_device():
         return None, []
 
 
-def _select_providers():
+def _select_providers(force_cpu=False):
+    if force_cpu:
+        return ['CPUExecutionProvider']
     import onnxruntime as ort
     available = set(ort.get_available_providers())
     providers = []
@@ -127,10 +129,11 @@ _oppai_cache = {}
 _oppai_cache_lock = threading.Lock()
 
 
-def _oppai_load(model_variant="V1.1", progress_cb=None):
+def _oppai_load(model_variant="V1.1", progress_cb=None, force_cpu=False):
+    cache_key = (model_variant, force_cpu)
     with _oppai_cache_lock:
-        if model_variant in _oppai_cache:
-            return _oppai_cache[model_variant]
+        if cache_key in _oppai_cache:
+            return _oppai_cache[cache_key]
 
     cache = _cache_dir(f"oppai_oracle/{model_variant}_onnx")
     base = f"{OPPAI_BASE_URL}/{model_variant}_onnx"
@@ -141,9 +144,12 @@ def _oppai_load(model_variant="V1.1", progress_cb=None):
     )
 
     if progress_cb:
-        progress_cb(f"Loading OppaiOracle {model_variant} ONNX session...")
+        suffix = " (CPU fallback)" if force_cpu else ""
+        progress_cb(f"Loading OppaiOracle {model_variant} ONNX session{suffix}...")
     import onnxruntime as ort
-    session = ort.InferenceSession(files["model.onnx"], providers=_select_providers())
+    session = ort.InferenceSession(
+        files["model.onnx"], providers=_select_providers(force_cpu=force_cpu),
+    )
 
     with open(files["vocabulary.json"], "r", encoding="utf-8") as f:
         vocab_data = json.load(f)
@@ -165,10 +171,17 @@ def _oppai_load(model_variant="V1.1", progress_cb=None):
         "pad_color": tuple(pp.get("pad_color_rgb", [114, 114, 114])),
         "primary_input": input_names[0],
         "has_mask_input": "padding_mask" in input_names,
+        "model_variant": model_variant,
+        "force_cpu": force_cpu,
     }
     with _oppai_cache_lock:
-        _oppai_cache[model_variant] = bundle
+        _oppai_cache[cache_key] = bundle
     return bundle
+
+
+def _oppai_invalidate_gpu_cache(model_variant):
+    with _oppai_cache_lock:
+        _oppai_cache.pop((model_variant, False), None)
 
 
 def _oppai_preprocess(image_path, image_size, mean, std, pad_color):
@@ -257,10 +270,11 @@ _pixai_cache = {}
 _pixai_cache_lock = threading.Lock()
 
 
-def _pixai_load(progress_cb=None):
+def _pixai_load(progress_cb=None, force_cpu=False):
+    cache_key = ("v0.9", force_cpu)
     with _pixai_cache_lock:
-        if "v0.9" in _pixai_cache:
-            return _pixai_cache["v0.9"]
+        if cache_key in _pixai_cache:
+            return _pixai_cache[cache_key]
 
     cache = _cache_dir("pixai_tagger/v0.9")
     files = _ensure_files(
@@ -270,9 +284,12 @@ def _pixai_load(progress_cb=None):
     )
 
     if progress_cb:
-        progress_cb("Loading PixAI Tagger v0.9 ONNX session...")
+        suffix = " (CPU fallback)" if force_cpu else ""
+        progress_cb(f"Loading PixAI Tagger v0.9 ONNX session{suffix}...")
     import onnxruntime as ort
-    session = ort.InferenceSession(files["model.onnx"], providers=_select_providers())
+    session = ort.InferenceSession(
+        files["model.onnx"], providers=_select_providers(force_cpu=force_cpu),
+    )
 
     tag_names = []
     tag_categories = []
@@ -296,10 +313,16 @@ def _pixai_load(progress_cb=None):
         "default_thresholds": default_thresholds,
         "image_size": 448,
         "primary_input": input_names[0],
+        "force_cpu": force_cpu,
     }
     with _pixai_cache_lock:
-        _pixai_cache["v0.9"] = bundle
+        _pixai_cache[cache_key] = bundle
     return bundle
+
+
+def _pixai_invalidate_gpu_cache():
+    with _pixai_cache_lock:
+        _pixai_cache.pop(("v0.9", False), None)
 
 
 def _pixai_preprocess(image_path, image_size):
@@ -364,8 +387,9 @@ def _merge_tags(file_manager, img_path, new_tags):
 class _BaseBatchTaggerWorker(QThread):
     """Common scaffolding for batch taggers. Subclasses provide:
        - LABEL (str): human-readable tagger name for status messages
-       - _load(progress_cb): warm up / download model, return a bundle
+       - _load(progress_cb, force_cpu): warm up / download model, return a bundle
        - _infer(bundle, image_path): return list[str] of tags for one image
+       - _invalidate_gpu_cache(): drop the cached GPU bundle so future loads use CPU
     """
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int, int, str)
@@ -377,11 +401,14 @@ class _BaseBatchTaggerWorker(QThread):
         self.file_manager = file_manager
         self.image_paths = image_paths
 
-    def _load(self, progress_cb=None):
+    def _load(self, progress_cb=None, force_cpu=False):
         raise NotImplementedError
 
     def _infer(self, bundle, image_path):
         raise NotImplementedError
+
+    def _invalidate_gpu_cache(self):
+        pass
 
     def run(self):
         total = len(self.image_paths)
@@ -404,10 +431,20 @@ class _BaseBatchTaggerWorker(QThread):
             self.progress.emit(i, total, os.path.basename(img_path))
             try:
                 new_tags = self._infer(bundle, img_path)
-                _merge_tags(self.file_manager, img_path, new_tags)
-                success_count += 1
             except Exception:
                 traceback.print_exc()
+                if bundle.get("force_cpu"):
+                    continue
+                self._invalidate_gpu_cache()
+                try:
+                    self.progress.emit(i, total, "GPU inference failed; reloading on CPU...")
+                    bundle = self._load(force_cpu=True)
+                    new_tags = self._infer(bundle, img_path)
+                except Exception:
+                    traceback.print_exc()
+                    continue
+            _merge_tags(self.file_manager, img_path, new_tags)
+            success_count += 1
         self.finished.emit(success_count, total, "")
 
 
@@ -422,11 +459,14 @@ class _BaseSingleTaggerWorker(QThread):
         super().__init__()
         self.image_path = image_path
 
-    def _load(self, progress_cb=None):
+    def _load(self, progress_cb=None, force_cpu=False):
         raise NotImplementedError
 
     def _infer(self, bundle, image_path):
         raise NotImplementedError
+
+    def _invalidate_gpu_cache(self):
+        pass
 
     def run(self):
         try:
@@ -436,7 +476,16 @@ class _BaseSingleTaggerWorker(QThread):
                 return
             self.progress.emit(f"Running {self.LABEL} on {device_name}...")
             bundle = self._load(progress_cb=self.progress.emit)
-            tags = self._infer(bundle, self.image_path)
+            try:
+                tags = self._infer(bundle, self.image_path)
+            except Exception:
+                if bundle.get("force_cpu"):
+                    raise
+                traceback.print_exc()
+                self._invalidate_gpu_cache()
+                self.progress.emit("GPU inference failed; reloading on CPU...")
+                bundle = self._load(progress_cb=self.progress.emit, force_cpu=True)
+                tags = self._infer(bundle, self.image_path)
             self.finished.emit(tags, "")
         except Exception as e:
             traceback.print_exc()
@@ -451,11 +500,14 @@ class OppaiOracleWorker(_BaseSingleTaggerWorker):
         self.model_variant = model_variant
         self.LABEL = f"OppaiOracle {model_variant}"
 
-    def _load(self, progress_cb=None):
-        return _oppai_load(self.model_variant, progress_cb=progress_cb)
+    def _load(self, progress_cb=None, force_cpu=False):
+        return _oppai_load(self.model_variant, progress_cb=progress_cb, force_cpu=force_cpu)
 
     def _infer(self, bundle, image_path):
         return _oppai_infer(bundle, image_path, self.threshold, self.top_k)
+
+    def _invalidate_gpu_cache(self):
+        _oppai_invalidate_gpu_cache(self.model_variant)
 
 
 class BatchOppaiOracleWorker(_BaseBatchTaggerWorker):
@@ -466,11 +518,14 @@ class BatchOppaiOracleWorker(_BaseBatchTaggerWorker):
         self.model_variant = model_variant
         self.LABEL = f"OppaiOracle {model_variant}"
 
-    def _load(self, progress_cb=None):
-        return _oppai_load(self.model_variant, progress_cb=progress_cb)
+    def _load(self, progress_cb=None, force_cpu=False):
+        return _oppai_load(self.model_variant, progress_cb=progress_cb, force_cpu=force_cpu)
 
     def _infer(self, bundle, image_path):
         return _oppai_infer(bundle, image_path, self.threshold, self.top_k)
+
+    def _invalidate_gpu_cache(self):
+        _oppai_invalidate_gpu_cache(self.model_variant)
 
 
 class PixAITaggerWorker(_BaseSingleTaggerWorker):
@@ -482,8 +537,8 @@ class PixAITaggerWorker(_BaseSingleTaggerWorker):
         self.threshold_character = threshold_character
         self.top_k = top_k
 
-    def _load(self, progress_cb=None):
-        return _pixai_load(progress_cb=progress_cb)
+    def _load(self, progress_cb=None, force_cpu=False):
+        return _pixai_load(progress_cb=progress_cb, force_cpu=force_cpu)
 
     def _infer(self, bundle, image_path):
         return _pixai_infer(
@@ -492,6 +547,9 @@ class PixAITaggerWorker(_BaseSingleTaggerWorker):
             threshold_character=self.threshold_character,
             top_k=self.top_k,
         )
+
+    def _invalidate_gpu_cache(self):
+        _pixai_invalidate_gpu_cache()
 
 
 class BatchPixAITaggerWorker(_BaseBatchTaggerWorker):
@@ -504,8 +562,8 @@ class BatchPixAITaggerWorker(_BaseBatchTaggerWorker):
         self.threshold_character = threshold_character
         self.top_k = top_k
 
-    def _load(self, progress_cb=None):
-        return _pixai_load(progress_cb=progress_cb)
+    def _load(self, progress_cb=None, force_cpu=False):
+        return _pixai_load(progress_cb=progress_cb, force_cpu=force_cpu)
 
     def _infer(self, bundle, image_path):
         return _pixai_infer(
@@ -514,3 +572,6 @@ class BatchPixAITaggerWorker(_BaseBatchTaggerWorker):
             threshold_character=self.threshold_character,
             top_k=self.top_k,
         )
+
+    def _invalidate_gpu_cache(self):
+        _pixai_invalidate_gpu_cache()
