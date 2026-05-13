@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 )
 from ui_components import FlowLayout, TagButton, ClickableImageLabel, FlowContainer
 from file_manager import FileManager
-from ai_tagger import PixAITaggerWorker, Florence2Worker, BatchPixAITaggerWorker, BatchFlorence2Worker
+from ai_tagger import PixAITaggerWorker, OppaiOracleWorker, BatchPixAITaggerWorker, BatchOppaiOracleWorker
 
 COLORS = {
     "bg": "#1e1e1e",
@@ -225,32 +225,34 @@ class MainWindow(QMainWindow):
         self.pixai_btn = QPushButton("Run PixAI Tagger")
         self.pixai_btn.setStyleSheet("background-color: #9b59b6; color: white; padding: 5px;")
         self.pixai_btn.clicked.connect(self.run_pixai_tagger)
-        self.florence_btn = QPushButton("Run Florence-2")
-        self.florence_btn.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
-        self.florence_btn.clicked.connect(self.run_florence2)
+        self.oppai_btn = QPushButton("Run OppaiOracle")
+        self.oppai_btn.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
+        self.oppai_btn.clicked.connect(self.run_oppai_oracle)
         ai_single_layout.addWidget(self.pixai_btn)
-        ai_single_layout.addWidget(self.florence_btn)
+        ai_single_layout.addWidget(self.oppai_btn)
         ai_layout.addLayout(ai_single_layout)
 
-        flo_task_layout = QHBoxLayout()
-        flo_task_layout.addWidget(QLabel("Florence-2 Task:"))
-        self.flo_task_combo = QComboBox()
-        self.flo_task_combo.addItems([
-            "<DETAILED_CAPTION>", "<CAPTION>", "<OCR>",
-            "<OCR_WITH_REGION>", "<REGION_PROPOSAL>",
-        ])
-        flo_task_layout.addWidget(self.flo_task_combo)
-        ai_layout.addLayout(flo_task_layout)
+        oppai_opt_layout = QHBoxLayout()
+        oppai_opt_layout.addWidget(QLabel("OppaiOracle Model:"))
+        self.oppai_model_combo = QComboBox()
+        self.oppai_model_combo.addItems(["V1.1", "V1"])
+        oppai_opt_layout.addWidget(self.oppai_model_combo)
+        oppai_opt_layout.addWidget(QLabel("Threshold:"))
+        self.oppai_threshold_edit = QLineEdit("0.4")
+        self.oppai_threshold_edit.setFixedWidth(60)
+        oppai_opt_layout.addWidget(self.oppai_threshold_edit)
+        oppai_opt_layout.addStretch(1)
+        ai_layout.addLayout(oppai_opt_layout)
 
         batch_ai_layout = QHBoxLayout()
         self.batch_pixai_btn = QPushButton("Batch Tag All (PixAI)")
         self.batch_pixai_btn.setStyleSheet("background-color: #8e44ad; color: white; padding: 5px;")
         self.batch_pixai_btn.clicked.connect(self.run_batch_pixai)
-        self.batch_florence_btn = QPushButton("Batch Caption All (Florence-2)")
-        self.batch_florence_btn.setStyleSheet("background-color: #d35400; color: white; padding: 5px;")
-        self.batch_florence_btn.clicked.connect(self.run_batch_florence)
+        self.batch_oppai_btn = QPushButton("Batch Tag All (OppaiOracle)")
+        self.batch_oppai_btn.setStyleSheet("background-color: #d35400; color: white; padding: 5px;")
+        self.batch_oppai_btn.clicked.connect(self.run_batch_oppai)
         batch_ai_layout.addWidget(self.batch_pixai_btn)
-        batch_ai_layout.addWidget(self.batch_florence_btn)
+        batch_ai_layout.addWidget(self.batch_oppai_btn)
         ai_layout.addLayout(batch_ai_layout)
         image_tab_layout.addLayout(ai_layout)
 
@@ -628,11 +630,18 @@ class MainWindow(QMainWindow):
 
     def set_ai_buttons_enabled(self, enabled: bool):
         self.pixai_btn.setEnabled(enabled)
-        self.florence_btn.setEnabled(enabled)
+        self.oppai_btn.setEnabled(enabled)
         self.batch_pixai_btn.setEnabled(enabled)
-        self.batch_florence_btn.setEnabled(enabled)
+        self.batch_oppai_btn.setEnabled(enabled)
         self.add_all_btn.setEnabled(enabled)
         self.remove_all_btn.setEnabled(enabled)
+
+    def _get_oppai_threshold(self) -> float:
+        try:
+            val = float(self.oppai_threshold_edit.text().strip())
+            return max(0.0, min(1.0, val))
+        except ValueError:
+            return 0.4
 
     def run_pixai_tagger(self):
         img_path = self.file_manager.get_current_image_path()
@@ -664,25 +673,27 @@ class MainWindow(QMainWindow):
             self.batch_pixai_worker.finished.connect(self.on_batch_finished)
             self.batch_pixai_worker.start()
 
-    def run_florence2(self):
+    def run_oppai_oracle(self):
         img_path = self.file_manager.get_current_image_path()
         if not img_path:
             return
-        task_prompt = self.flo_task_combo.currentText()
+        variant = self.oppai_model_combo.currentText()
+        threshold = self._get_oppai_threshold()
         self.set_ai_buttons_enabled(False)
-        self.statusBar().showMessage(f"Initializing Florence-2 ({task_prompt})...")
-        self.flo_worker = Florence2Worker(img_path, task_prompt=task_prompt)
-        self.flo_worker.progress.connect(self.update_status)
-        self.flo_worker.finished.connect(self.on_ai_finished)
-        self.flo_worker.start()
+        self.statusBar().showMessage(f"Initializing OppaiOracle ({variant})...")
+        self.oppai_worker = OppaiOracleWorker(img_path, threshold=threshold, model_variant=variant)
+        self.oppai_worker.progress.connect(self.update_status)
+        self.oppai_worker.finished.connect(self.on_ai_finished)
+        self.oppai_worker.start()
 
-    def run_batch_florence(self):
+    def run_batch_oppai(self):
         if not self.file_manager.image_files:
             QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
             return
-        task_prompt = self.flo_task_combo.currentText()
+        variant = self.oppai_model_combo.currentText()
+        threshold = self._get_oppai_threshold()
         reply = QMessageBox.question(self, "Confirm",
-                                     f"Run Florence-2 ({task_prompt}) on all {len(self.file_manager.image_files)} images?",
+                                     f"Run OppaiOracle ({variant}) on all {len(self.file_manager.image_files)} images?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.set_ai_buttons_enabled(False)
@@ -691,12 +702,13 @@ class MainWindow(QMainWindow):
             self.cancel_batch_btn.setVisible(True)
             self.progress_bar.setValue(0)
             self.progress_bar.setMaximum(len(self.file_manager.image_files))
-            self.batch_flo_worker = BatchFlorence2Worker(
-                self.file_manager, self.file_manager.image_files, task_prompt=task_prompt
+            self.batch_oppai_worker = BatchOppaiOracleWorker(
+                self.file_manager, self.file_manager.image_files,
+                threshold=threshold, model_variant=variant,
             )
-            self.batch_flo_worker.progress.connect(self.update_batch_progress)
-            self.batch_flo_worker.finished.connect(self.on_batch_finished)
-            self.batch_flo_worker.start()
+            self.batch_oppai_worker.progress.connect(self.update_batch_progress)
+            self.batch_oppai_worker.finished.connect(self.on_batch_finished)
+            self.batch_oppai_worker.start()
 
     def update_status(self, msg: str):
         self.statusBar().showMessage(msg)
@@ -705,9 +717,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "batch_pixai_worker") and self.batch_pixai_worker.isRunning():
             self.batch_pixai_worker.requestInterruption()
             self.statusBar().showMessage("Cancelling PixAI batch...")
-        if hasattr(self, "batch_flo_worker") and self.batch_flo_worker.isRunning():
-            self.batch_flo_worker.requestInterruption()
-            self.statusBar().showMessage("Cancelling Florence-2 batch...")
+        if hasattr(self, "batch_oppai_worker") and self.batch_oppai_worker.isRunning():
+            self.batch_oppai_worker.requestInterruption()
+            self.statusBar().showMessage("Cancelling OppaiOracle batch...")
         self.cancel_batch_btn.setEnabled(False)
 
     def update_batch_progress(self, current: int, total: int, filename: str):

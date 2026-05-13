@@ -1,7 +1,7 @@
 # AI Tag Editor
 
 シンプルなGUIで画像フォルダ内のタグテキスト（`.txt`）を編集できるツールです。
-さらに、ローカルAI（WD Tagger & Florence-2）を統合しており、Danbooru形式のタグや詳細な自然言語キャプションを画像から自動抽出してテキストファイルに直接追加・保存することができます。
+さらに、ローカルAI（PixAI Tagger & OppaiOracle）を統合しており、Danbooru形式のタグを画像から自動抽出してテキストファイルに直接追加・保存することができます。
 
 ## 推奨環境
 - Linux または Windows
@@ -14,8 +14,8 @@
 - **タグの新規追加**: テキストボックスに新しいタグを入力し、現在の画像にワンクリックで追加できます。
 - **一括操作**: `[Add to All]` や `[Remove from All]` を使うことで、フォルダ内の全てのテキストファイルに対してタグを一括追加・削除できます。
 - **AIによる自動タグ付け**:
-  - **Run WD Tagger**: `SmilingWolf/wd-vit-tagger-v3` モデルを使用して、アニメ・イラスト向けの正確なDanbooru/e621タグを自動抽出します。
-  - **Run Florence-2**: `microsoft/Florence-2-large` モデルを使用して、画像の詳細な説明文（キャプション）を自動生成します。
+  - **Run PixAI Tagger**: `deepghs/pixai-tagger-v0.9` モデルを使用して、アニメ・イラスト向けの正確なDanbooru/e621タグを自動抽出します。
+  - **Run OppaiOracle**: `Grio43/OppaiOracle` の ONNX モデル（V1: 320×320 / V1.1: 448×448）を使用して、19,294個の一般タグから高精度に Danbooru タグを推定します。
 
 ## インストールと起動
 ### Linux
@@ -32,7 +32,7 @@ chmod +x run.sh
 ※ 初回起動時は仮想環境（`venv`）の作成と必要なPythonライブラリのインストールが行われるため、数分かかる場合があります。
 
 ## AIモデルの初回ダウンロードについて
-「Run WD Tagger」または「Run Florence-2」ボタンを初めてクリックした際、Hugging Faceから自動的にAIモデル本体のダウンロードが開始されます。これにはネットワーク環境にもよりますがある程度の時間（数分〜）がかかります。
+「Run PixAI Tagger」または「Run OppaiOracle」ボタンを初めてクリックした際、Hugging Faceから自動的にAIモデル本体のダウンロードが開始されます。OppaiOracle V1.1 のモデルファイルは約 1GB あり、ネットワーク環境にもよりますがある程度の時間（数分〜）がかかります。
 進捗状況はアプリケーションウィンドウ下部のステータスバーに表示されます。
 
 ## AIの実行環境（GPU/CPU）
