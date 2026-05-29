@@ -18,16 +18,16 @@
   - **Run OppaiOracle**: `Grio43/OppaiOracle` の ONNX モデル（V1: 320×320 / V1.1: 448×448）を使用して、19,294個の一般タグから高精度に Danbooru タグを推定します。
 
 ## インストールと起動
-### Linux
+### Linux / macOS
 ```bash
 # ターミナルで実行
 cd tag_editor
-chmod +x run.sh
-./run.sh
+chmod +x tag_editor_run.sh
+./tag_editor_run.sh
 ```
 
 ### Windows
-フォルダ内にある `run.bat` をダブルクリックして実行してください。
+フォルダ内にある `tag_editor_run.bat` をダブルクリックして実行してください。
 
 ※ 初回起動時は仮想環境（`venv`）の作成と必要なPythonライブラリのインストールが行われるため、数分かかる場合があります。
 
