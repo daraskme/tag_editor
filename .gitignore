@@ -34,6 +34,9 @@ huggingface/
 ehthumbs.db
 Thumbs.db
 
+# Runtime logs
+*.log
+
 # Project specifics
-*.csv 
+*.csv
 # (if you don't want selected_tags.csv to be committed, though it's small)
