@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSplitter, QScrollArea, QLineEdit, QFileDialog, QMessageBox,
     QMenuBar, QInputDialog, QSizePolicy, QComboBox, QProgressBar,
-    QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox,
 )
 from ui_components import FlowLayout, TagButton, ClickableImageLabel, FlowContainer
 from file_manager import FileManager
@@ -355,6 +355,23 @@ class MainWindow(QMainWindow):
         all_search_layout.addWidget(refresh_btn)
         all_tab_layout.addLayout(all_search_layout)
 
+        # Copy tags that appear in N or more images
+        copy_freq_layout = QHBoxLayout()
+        copy_freq_layout.addWidget(QLabel("Min images:"))
+        self.copy_min_count_spin = QSpinBox()
+        self.copy_min_count_spin.setRange(1, 999999)
+        self.copy_min_count_spin.setValue(2)
+        self.copy_min_count_spin.setFixedWidth(80)
+        copy_freq_layout.addWidget(self.copy_min_count_spin)
+        self.copy_frequent_btn = QPushButton("📋 Copy Tags ≥ N Images")
+        self.copy_frequent_btn.setStyleSheet(
+            f"background-color: {COLORS['primary']}; color: white; font-weight: bold;"
+        )
+        self.copy_frequent_btn.clicked.connect(self._copy_frequent_tags)
+        copy_freq_layout.addWidget(self.copy_frequent_btn)
+        copy_freq_layout.addStretch(1)
+        all_tab_layout.addLayout(copy_freq_layout)
+
         self.all_tags_table = QTableWidget()
         self.all_tags_table.setColumnCount(2)
         self.all_tags_table.setHorizontalHeaderLabels(["Tag", "Images"])
@@ -588,6 +605,28 @@ class MainWindow(QMainWindow):
         filter_text = self.all_tags_search.text()
         tag_counts = self.file_manager.get_tag_counts()
         self._populate_all_tags_table(tag_counts, filter_text)
+
+    def _copy_frequent_tags(self):
+        """Copy every tag that appears in at least N images to the clipboard.
+
+        Tags are placed on the system clipboard as a comma-separated, Danbooru
+        style string and also stored in the in-app tag clipboard so the
+        'Paste Tags' button works for them too. Order follows get_tag_counts()
+        (most frequent first)."""
+        min_count = self.copy_min_count_spin.value()
+        tags = [tag for tag, count in self.file_manager.get_tag_counts()
+                if count >= min_count]
+        if not tags:
+            QMessageBox.information(
+                self, "Copy Tags",
+                f"{min_count}枚以上の画像に付いているタグはありません。",
+            )
+            return
+        QGuiApplication.clipboard().setText(", ".join(tags))
+        self.tag_clipboard = list(tags)
+        self.statusBar().showMessage(
+            f"{min_count}枚以上に出現する {len(tags)}個のタグをコピーしました。", 3000,
+        )
 
     def _filter_all_tags_table(self, text: str):
         tag_counts = self.file_manager.get_tag_counts()
