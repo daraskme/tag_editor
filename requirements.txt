@@ -3,6 +3,9 @@ Pillow
 numpy>=2.0.0
 huggingface-hub
 requests
+# Used to neutralize baked-in MemcpyToHost/FromHost nodes so models load on the
+# CPU EP of onnxruntime-directml (see _clean_onnx_model in ai_tagger.py).
+onnx>=1.17.0
 # DirectML build is Windows-only; other platforms use the standard ONNX Runtime
 # (which still picks up CUDAExecutionProvider when a GPU build is available).
 onnxruntime-directml>=1.20.0; sys_platform == 'win32'

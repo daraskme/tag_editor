@@ -110,6 +110,48 @@ def _ensure_files(cache_dir, base_url, filenames, progress_cb=None, label_prefix
     return paths
 
 
+def _clean_onnx_model(model_path, progress_cb=None):
+    """Rewrite baked-in device-transfer nodes so the model loads on any provider.
+
+    Some ONNX files (e.g. OppaiOracle, saved after CUDA-EP graph partitioning)
+    carry MemcpyToHost/MemcpyFromHost nodes in the serialized graph. The CPU EP in
+    onnxruntime-directml has no kernel for them, so a CPU-only session fails to
+    initialize with NOT_IMPLEMENTED ("Could not find an implementation for
+    MemcpyToHost"). Those nodes are 1-in/1-out identity copies, so we rewrite them
+    to Identity (verified byte-identical output) and cache the result next to the
+    original. Returns the cleaned path, or the original path when cleaning isn't
+    needed or onnx isn't importable.
+    """
+    clean_path = model_path + ".clean.onnx"
+    try:
+        if (os.path.exists(clean_path) and os.path.getsize(clean_path) > 0
+                and os.path.getmtime(clean_path) >= os.path.getmtime(model_path)):
+            return clean_path
+        import onnx
+    except ImportError:
+        return model_path
+    try:
+        model = onnx.load(model_path)
+        changed = 0
+        for node in model.graph.node:
+            if node.op_type in ("MemcpyToHost", "MemcpyFromHost", "Memcpy"):
+                node.op_type = "Identity"
+                node.domain = ""
+                del node.attribute[:]
+                changed += 1
+        if changed == 0:
+            return model_path
+        if progress_cb:
+            progress_cb(f"Preparing ONNX graph ({changed} device-transfer node(s))...")
+        tmp = clean_path + ".part"
+        onnx.save(model, tmp)
+        os.replace(tmp, clean_path)
+        return clean_path
+    except Exception:
+        traceback.print_exc()
+        return model_path
+
+
 def _composite_rgb(img, background_color):
     """Flatten RGBA/LA/transparent images onto a solid background.
     Returns (rgb_image, was_composited)."""
@@ -147,13 +189,9 @@ def _oppai_load(model_variant="V1.1", progress_cb=None, force_cpu=False):
         suffix = " (CPU fallback)" if force_cpu else ""
         progress_cb(f"Loading OppaiOracle {model_variant} ONNX session{suffix}...")
     import onnxruntime as ort
-    # onnxruntime-directml can leave MemcpyToHost nodes in CPU-only sessions and
-    # fail with NOT_IMPLEMENTED at init; disable the transformer that inserts them.
-    extra = {"disabled_optimizers": ["MemcpyTransformer"]} if force_cpu else {}
+    model_path = _clean_onnx_model(files["model.onnx"], progress_cb=progress_cb)
     session = ort.InferenceSession(
-        files["model.onnx"],
-        providers=_select_providers(force_cpu=force_cpu),
-        **extra,
+        model_path, providers=_select_providers(force_cpu=force_cpu),
     )
 
     with open(files["vocabulary.json"], "r", encoding="utf-8") as f:
@@ -292,11 +330,9 @@ def _pixai_load(progress_cb=None, force_cpu=False):
         suffix = " (CPU fallback)" if force_cpu else ""
         progress_cb(f"Loading PixAI Tagger v0.9 ONNX session{suffix}...")
     import onnxruntime as ort
-    extra = {"disabled_optimizers": ["MemcpyTransformer"]} if force_cpu else {}
+    model_path = _clean_onnx_model(files["model.onnx"], progress_cb=progress_cb)
     session = ort.InferenceSession(
-        files["model.onnx"],
-        providers=_select_providers(force_cpu=force_cpu),
-        **extra,
+        model_path, providers=_select_providers(force_cpu=force_cpu),
     )
 
     tag_names = []

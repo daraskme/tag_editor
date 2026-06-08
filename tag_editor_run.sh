@@ -47,7 +47,7 @@ source venv/bin/activate || { echo "[ERROR] Activation failed."; hold_open; exit
 
 # Quick check: are the core packages already importable? If so, skip the
 # (slow) dependency install on subsequent launches.
-if python -c "import onnxruntime, PyQt6, PIL, huggingface_hub, numpy, requests" 2>/dev/null; then
+if python -c "import onnxruntime, onnx, PyQt6, PIL, huggingface_hub, numpy, requests" 2>/dev/null; then
     echo "Dependencies already present."
 else
     echo "Installing dependencies... (This may take a while)"

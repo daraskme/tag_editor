@@ -32,7 +32,7 @@ echo done > "venv\.repaired_v8"
 echo [REPAIR] Setup complete!
 
 :check_quick
-python -c "import onnxruntime, PyQt6, PIL, huggingface_hub, numpy, requests" 2>nul
+python -c "import onnxruntime, onnx, PyQt6, PIL, huggingface_hub, numpy, requests" 2>nul
 if not errorlevel 1 goto :start_app
 
 echo [INFO] Core packages missing, installing dependencies...
