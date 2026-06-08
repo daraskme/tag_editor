@@ -147,8 +147,13 @@ def _oppai_load(model_variant="V1.1", progress_cb=None, force_cpu=False):
         suffix = " (CPU fallback)" if force_cpu else ""
         progress_cb(f"Loading OppaiOracle {model_variant} ONNX session{suffix}...")
     import onnxruntime as ort
+    # onnxruntime-directml can leave MemcpyToHost nodes in CPU-only sessions and
+    # fail with NOT_IMPLEMENTED at init; disable the transformer that inserts them.
+    extra = {"disabled_optimizers": ["MemcpyTransformer"]} if force_cpu else {}
     session = ort.InferenceSession(
-        files["model.onnx"], providers=_select_providers(force_cpu=force_cpu),
+        files["model.onnx"],
+        providers=_select_providers(force_cpu=force_cpu),
+        **extra,
     )
 
     with open(files["vocabulary.json"], "r", encoding="utf-8") as f:
@@ -287,8 +292,11 @@ def _pixai_load(progress_cb=None, force_cpu=False):
         suffix = " (CPU fallback)" if force_cpu else ""
         progress_cb(f"Loading PixAI Tagger v0.9 ONNX session{suffix}...")
     import onnxruntime as ort
+    extra = {"disabled_optimizers": ["MemcpyTransformer"]} if force_cpu else {}
     session = ort.InferenceSession(
-        files["model.onnx"], providers=_select_providers(force_cpu=force_cpu),
+        files["model.onnx"],
+        providers=_select_providers(force_cpu=force_cpu),
+        **extra,
     )
 
     tag_names = []
@@ -439,6 +447,11 @@ class _BaseBatchTaggerWorker(QThread):
                 try:
                     self.progress.emit(i, total, "GPU inference failed; reloading on CPU...")
                     bundle = self._load(force_cpu=True)
+                except Exception as e:
+                    traceback.print_exc()
+                    self.finished.emit(success_count, total, f"CPU fallback failed to load: {e}")
+                    return
+                try:
                     new_tags = self._infer(bundle, img_path)
                 except Exception:
                     traceback.print_exc()
