@@ -1,0 +1,68 @@
+name: Build & Release (Windows)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Derive version
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'
+          if ($version.StartsWith('v')) { $version = $version.Substring(1) } else { $version = '0.0.0.dev' }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Build
+        run: pyinstaller --noconfirm --clean tag_editor.spec
+
+      - name: Assert critical DLLs bundled
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/tag_editor/_internal/onnxruntime/capi/DirectML.dll')) {
+            Write-Error 'DirectML.dll missing from build output'
+            exit 1
+          }
+          if (-not (Test-Path 'dist/tag_editor/_internal/PyQt6/Qt6/plugins/platforms/qwindows.dll')) {
+            Write-Error 'qwindows.dll missing from build output'
+            exit 1
+          }
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $p = Start-Process 'dist\tag_editor\tag_editor.exe' -ArgumentList '--smoke-test' -PassThru -Wait
+          if ($p.ExitCode -ne 0) {
+            Write-Error "Smoke test failed with exit code $($p.ExitCode)"
+            exit 1
+          }
+
+      - name: Zip
+        shell: pwsh
+        run: 7z a -tzip "tag_editor-v$env:APP_VERSION-windows-x64.zip" .\dist\tag_editor
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tag_editor-*-windows-x64.zip
+          generate_release_notes: true

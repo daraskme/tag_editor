@@ -37,6 +37,9 @@ Thumbs.db
 # Runtime logs
 *.log
 
+# PyInstaller build output (built locally / by CI, not committed)
+build/
+dist/
+
 # Project specifics
 *.csv
-# (if you don't want selected_tags.csv to be committed, though it's small)

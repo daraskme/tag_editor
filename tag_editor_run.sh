@@ -45,9 +45,10 @@ fi
 # shellcheck disable=SC1091
 source venv/bin/activate || { echo "[ERROR] Activation failed."; hold_open; exit 1; }
 
-# Quick check: are the core packages already importable? If so, skip the
-# (slow) dependency install on subsequent launches.
-if python -c "import onnxruntime, onnx, PyQt6, PIL, huggingface_hub, numpy, requests" 2>/dev/null; then
+# Reinstall whenever requirements.txt changes (byte-exact compare), not just
+# when the currently-installed packages happen to still be importable --
+# otherwise a version bump in requirements.txt would silently never apply.
+if cmp -s requirements.txt "venv/.reqs_installed" 2>/dev/null; then
     echo "Dependencies already present."
 else
     echo "Installing dependencies... (This may take a while)"
@@ -57,6 +58,7 @@ else
         hold_open
         exit 1
     fi
+    cp requirements.txt "venv/.reqs_installed"
 fi
 
 echo "Starting application..."

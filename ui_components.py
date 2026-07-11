@@ -142,16 +142,10 @@ class TagButton(QPushButton):
         super().mousePressEvent(event)
 
 class ClickableImageLabel(QLabel):
-    clicked = pyqtSignal()
-
     def __init__(self, parent=None):
         super().__init__(parent) # type: ignore
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setScaledContents(False) # We will scale pixmap manually
-
-    def mousePressEvent(self, event):
-        self.clicked.emit()
-        super().mousePressEvent(event)
 
 class FlowContainer(QWidget):
     def __init__(self, parent=None):

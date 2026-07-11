@@ -1,5 +1,5 @@
 import os
-import csv
+import sys
 import json
 import time
 import traceback
@@ -73,6 +73,9 @@ def _stream_download(url, dest, progress_cb=None, label=None, max_retries=5):
                 last_report = 0
                 with open(tmp, mode) as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        thread = QThread.currentThread()
+                        if thread is not None and thread.isInterruptionRequested():
+                            raise RuntimeError("Download cancelled")
                         if not chunk:
                             continue
                         f.write(chunk)
@@ -185,15 +188,6 @@ def _oppai_load(model_variant="V1.1", progress_cb=None, force_cpu=False):
         progress_cb=progress_cb, label_prefix=f"{model_variant}/",
     )
 
-    if progress_cb:
-        suffix = " (CPU fallback)" if force_cpu else ""
-        progress_cb(f"Loading OppaiOracle {model_variant} ONNX session{suffix}...")
-    import onnxruntime as ort
-    model_path = _clean_onnx_model(files["model.onnx"], progress_cb=progress_cb)
-    session = ort.InferenceSession(
-        model_path, providers=_select_providers(force_cpu=force_cpu),
-    )
-
     with open(files["vocabulary.json"], "r", encoding="utf-8") as f:
         vocab_data = json.load(f)
     tag_to_index = vocab_data.get("tag_to_index", vocab_data)
@@ -201,6 +195,49 @@ def _oppai_load(model_variant="V1.1", progress_cb=None, force_cpu=False):
 
     with open(files["preprocessing.json"], "r", encoding="utf-8") as f:
         pp = json.load(f)
+    image_size = int(pp.get("image_size", 448))
+
+    import onnxruntime as ort
+    import numpy as np
+    model_path = _clean_onnx_model(files["model.onnx"], progress_cb=progress_cb)
+    providers = _select_providers(force_cpu=force_cpu)
+
+    # Try the GPU provider(s) first, but verify with a real inference call before
+    # committing to the session: some GPU EP / model combinations (e.g. DirectML
+    # on this graph) load fine but fail deep inside the EP kernel on the first
+    # run(). Detecting that here -- once, at load time -- means the user sees one
+    # quiet fallback instead of a per-image crash-and-retry during a batch.
+    session = None
+    if providers != ['CPUExecutionProvider']:
+        if progress_cb:
+            progress_cb(f"Loading OppaiOracle {model_variant} ONNX session (GPU)...")
+        so = ort.SessionOptions()
+        # The failing EP's C++ exception text is emitted in the OS locale codepage
+        # (e.g. CP932 on Japanese Windows); pybind11 fails to UTF-8-decode it and
+        # onnxruntime also logs a garbled [E:onnxruntime ... ExecuteKernel] line to
+        # stderr. Severity 4 (FATAL-only) is the only level that suppresses it.
+        so.log_severity_level = 4
+        try:
+            candidate = ort.InferenceSession(model_path, sess_options=so, providers=providers)
+            input_names = [i.name for i in candidate.get_inputs()]
+            feed = {input_names[0]: np.zeros((1, 3, image_size, image_size), dtype=np.float32)}
+            if "padding_mask" in input_names:
+                feed["padding_mask"] = np.zeros((1, image_size, image_size), dtype=bool)
+            candidate.run(None, feed)
+            session = candidate
+        except Exception:
+            # Known-bad EP/model combination; not actionable here, so fall
+            # through to CPU quietly instead of surfacing a raw traceback.
+            if progress_cb:
+                progress_cb(
+                    f"GPU inference not usable for OppaiOracle {model_variant}; using CPU..."
+                )
+
+    if session is None:
+        if progress_cb and providers == ['CPUExecutionProvider']:
+            progress_cb(f"Loading OppaiOracle {model_variant} ONNX session (CPU)...")
+        session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+        force_cpu = True
 
     input_names = [i.name for i in session.get_inputs()]
     bundle = {
@@ -208,7 +245,7 @@ def _oppai_load(model_variant="V1.1", progress_cb=None, force_cpu=False):
         "index_to_tag": index_to_tag,
         "pad_idx": int(tag_to_index.get("<PAD>", 0)),
         "unk_idx": int(tag_to_index.get("<UNK>", 1)),
-        "image_size": int(pp.get("image_size", 448)),
+        "image_size": image_size,
         "mean": pp.get("normalize_mean", [0.5, 0.5, 0.5]),
         "std": pp.get("normalize_std", [0.5, 0.5, 0.5]),
         "pad_color": tuple(pp.get("pad_color_rgb", [114, 114, 114])),
@@ -219,6 +256,10 @@ def _oppai_load(model_variant="V1.1", progress_cb=None, force_cpu=False):
     }
     with _oppai_cache_lock:
         _oppai_cache[cache_key] = bundle
+        if force_cpu:
+            # Also serve any future explicit force_cpu=True request from this
+            # same CPU session instead of rebuilding it.
+            _oppai_cache[(model_variant, True)] = bundle
     return bundle
 
 
@@ -269,11 +310,19 @@ def _sigmoid_if_needed(scores):
     return scores
 
 
+class ImageReadError(Exception):
+    """Raised when reading/decoding an image fails, as opposed to a model or
+    execution-provider failure. Callers must not treat this as a GPU failure."""
+
+
 def _oppai_infer(bundle, image_path, threshold, top_k):
     import numpy as np
-    inp, padding_mask, was_composited = _oppai_preprocess(
-        image_path, bundle["image_size"], bundle["mean"], bundle["std"], bundle["pad_color"],
-    )
+    try:
+        inp, padding_mask, was_composited = _oppai_preprocess(
+            image_path, bundle["image_size"], bundle["mean"], bundle["std"], bundle["pad_color"],
+        )
+    except Exception as e:
+        raise ImageReadError(f"{image_path}: {e}") from e
     feed = {bundle["primary_input"]: inp}
     if bundle["has_mask_input"]:
         feed["padding_mask"] = padding_mask
@@ -301,118 +350,6 @@ def _oppai_infer(bundle, image_path, threshold, top_k):
         if len(tags) >= top_k:
             break
     return tags
-
-
-# ── PixAI Tagger v0.9 (deepghs/pixai-tagger-v0.9-onnx) ───────────────────────
-
-PIXAI_REPO_ID = "deepghs/pixai-tagger-v0.9-onnx"
-PIXAI_BASE_URL = f"https://huggingface.co/{PIXAI_REPO_ID}/resolve/main"
-PIXAI_GENERAL_CATEGORY = 0
-PIXAI_CHARACTER_CATEGORY = 4
-_pixai_cache = {}
-_pixai_cache_lock = threading.Lock()
-
-
-def _pixai_load(progress_cb=None, force_cpu=False):
-    cache_key = ("v0.9", force_cpu)
-    with _pixai_cache_lock:
-        if cache_key in _pixai_cache:
-            return _pixai_cache[cache_key]
-
-    cache = _cache_dir("pixai_tagger/v0.9")
-    files = _ensure_files(
-        cache, PIXAI_BASE_URL,
-        ("model.onnx", "selected_tags.csv", "categories.json", "thresholds.csv"),
-        progress_cb=progress_cb, label_prefix="pixai/",
-    )
-
-    if progress_cb:
-        suffix = " (CPU fallback)" if force_cpu else ""
-        progress_cb(f"Loading PixAI Tagger v0.9 ONNX session{suffix}...")
-    import onnxruntime as ort
-    model_path = _clean_onnx_model(files["model.onnx"], progress_cb=progress_cb)
-    session = ort.InferenceSession(
-        model_path, providers=_select_providers(force_cpu=force_cpu),
-    )
-
-    tag_names = []
-    tag_categories = []
-    with open(files["selected_tags.csv"], "r", encoding="utf-8", newline='') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            tag_names.append(row["name"])
-            tag_categories.append(int(row["category"]))
-
-    default_thresholds = {}
-    with open(files["thresholds.csv"], "r", encoding="utf-8", newline='') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            default_thresholds[int(row["category"])] = float(row["threshold"])
-
-    input_names = [i.name for i in session.get_inputs()]
-    bundle = {
-        "session": session,
-        "tag_names": tag_names,
-        "tag_categories": tag_categories,
-        "default_thresholds": default_thresholds,
-        "image_size": 448,
-        "primary_input": input_names[0],
-        "force_cpu": force_cpu,
-    }
-    with _pixai_cache_lock:
-        _pixai_cache[cache_key] = bundle
-    return bundle
-
-
-def _pixai_invalidate_gpu_cache():
-    with _pixai_cache_lock:
-        _pixai_cache.pop(("v0.9", False), None)
-
-
-def _pixai_preprocess(image_path, image_size):
-    """Stretch-resize to image_size×image_size, normalize to [-1, 1]."""
-    import numpy as np
-    with Image.open(image_path) as img:
-        img.load()
-        img = ImageOps.exif_transpose(img)
-        img, _ = _composite_rgb(img, (255, 255, 255))
-        img = img.resize((image_size, image_size), Image.BILINEAR)
-        arr = np.asarray(img, dtype=np.float32) / 255.0
-
-    arr = (arr - 0.5) / 0.5
-    arr = arr.transpose(2, 0, 1)
-    return np.expand_dims(arr, axis=0)
-
-
-def _pixai_infer(bundle, image_path, threshold_general=None, threshold_character=None, top_k=None):
-    defaults = bundle["default_thresholds"]
-    if threshold_general is None:
-        threshold_general = defaults.get(PIXAI_GENERAL_CATEGORY, 0.3)
-    if threshold_character is None:
-        threshold_character = defaults.get(PIXAI_CHARACTER_CATEGORY, 0.85)
-
-    x = _pixai_preprocess(image_path, bundle["image_size"])
-    scores = _sigmoid_if_needed(bundle["session"].run(None, {bundle["primary_input"]: x})[0][0])
-
-    tag_names = bundle["tag_names"]
-    tag_categories = bundle["tag_categories"]
-
-    char_hits = []
-    general_hits = []
-    for idx, score in enumerate(scores):
-        cat = tag_categories[idx]
-        if cat == PIXAI_CHARACTER_CATEGORY and score >= threshold_character:
-            char_hits.append((float(score), idx))
-        elif cat == PIXAI_GENERAL_CATEGORY and score >= threshold_general:
-            general_hits.append((float(score), idx))
-
-    char_hits.sort(reverse=True)
-    general_hits.sort(reverse=True)
-
-    result = [tag_names[i] for _, i in char_hits] + [tag_names[i] for _, i in general_hits]
-    if top_k is not None:
-        result = result[:top_k]
-    return result
 
 
 # ── Worker classes ───────────────────────────────────────────────────────────
@@ -462,7 +399,7 @@ class _BaseBatchTaggerWorker(QThread):
             return
 
         try:
-            bundle = self._load()
+            bundle = self._load(progress_cb=lambda msg: self.progress.emit(0, total, msg))
         except Exception as e:
             traceback.print_exc()
             self.finished.emit(0, total, str(e))
@@ -475,22 +412,35 @@ class _BaseBatchTaggerWorker(QThread):
             self.progress.emit(i, total, os.path.basename(img_path))
             try:
                 new_tags = self._infer(bundle, img_path)
-            except Exception:
-                traceback.print_exc()
+            except ImageReadError as e:
+                print(f"[{self.LABEL}] {e}; skipped", file=sys.stderr)
+                continue
+            except Exception as e:
                 if bundle.get("force_cpu"):
+                    print(f"[{self.LABEL}] {os.path.basename(img_path)}: "
+                          f"{type(e).__name__}: {e}; skipped", file=sys.stderr)
                     continue
+                print(f"[{self.LABEL}] {os.path.basename(img_path)}: "
+                      f"{type(e).__name__}; falling back to CPU", file=sys.stderr)
                 self._invalidate_gpu_cache()
                 try:
                     self.progress.emit(i, total, "GPU inference failed; reloading on CPU...")
-                    bundle = self._load(force_cpu=True)
-                except Exception as e:
+                    bundle = self._load(
+                        force_cpu=True,
+                        progress_cb=lambda msg: self.progress.emit(i, total, msg),
+                    )
+                except Exception as e2:
                     traceback.print_exc()
-                    self.finished.emit(success_count, total, f"CPU fallback failed to load: {e}")
+                    self.finished.emit(success_count, total, f"CPU fallback failed to load: {e2}")
                     return
                 try:
                     new_tags = self._infer(bundle, img_path)
-                except Exception:
-                    traceback.print_exc()
+                except ImageReadError as e2:
+                    print(f"[{self.LABEL}] {e2}; skipped", file=sys.stderr)
+                    continue
+                except Exception as e2:
+                    print(f"[{self.LABEL}] {os.path.basename(img_path)}: "
+                          f"{type(e2).__name__}: {e2}; skipped", file=sys.stderr)
                     continue
             _merge_tags(self.file_manager, img_path, new_tags)
             success_count += 1
@@ -527,10 +477,12 @@ class _BaseSingleTaggerWorker(QThread):
             bundle = self._load(progress_cb=self.progress.emit)
             try:
                 tags = self._infer(bundle, self.image_path)
-            except Exception:
+            except ImageReadError:
+                raise
+            except Exception as e:
                 if bundle.get("force_cpu"):
                     raise
-                traceback.print_exc()
+                print(f"[{self.LABEL}] {type(e).__name__}; falling back to CPU", file=sys.stderr)
                 self._invalidate_gpu_cache()
                 self.progress.emit("GPU inference failed; reloading on CPU...")
                 bundle = self._load(progress_cb=self.progress.emit, force_cpu=True)
@@ -575,52 +527,3 @@ class BatchOppaiOracleWorker(_BaseBatchTaggerWorker):
 
     def _invalidate_gpu_cache(self):
         _oppai_invalidate_gpu_cache(self.model_variant)
-
-
-class PixAITaggerWorker(_BaseSingleTaggerWorker):
-    LABEL = "PixAI Tagger v0.9"
-
-    def __init__(self, image_path, threshold_general=None, threshold_character=None, top_k=128):
-        super().__init__(image_path)
-        self.threshold_general = threshold_general
-        self.threshold_character = threshold_character
-        self.top_k = top_k
-
-    def _load(self, progress_cb=None, force_cpu=False):
-        return _pixai_load(progress_cb=progress_cb, force_cpu=force_cpu)
-
-    def _infer(self, bundle, image_path):
-        return _pixai_infer(
-            bundle, image_path,
-            threshold_general=self.threshold_general,
-            threshold_character=self.threshold_character,
-            top_k=self.top_k,
-        )
-
-    def _invalidate_gpu_cache(self):
-        _pixai_invalidate_gpu_cache()
-
-
-class BatchPixAITaggerWorker(_BaseBatchTaggerWorker):
-    LABEL = "PixAI Tagger v0.9"
-
-    def __init__(self, file_manager, image_paths,
-                 threshold_general=None, threshold_character=None, top_k=128):
-        super().__init__(file_manager, image_paths)
-        self.threshold_general = threshold_general
-        self.threshold_character = threshold_character
-        self.top_k = top_k
-
-    def _load(self, progress_cb=None, force_cpu=False):
-        return _pixai_load(progress_cb=progress_cb, force_cpu=force_cpu)
-
-    def _infer(self, bundle, image_path):
-        return _pixai_infer(
-            bundle, image_path,
-            threshold_general=self.threshold_general,
-            threshold_character=self.threshold_character,
-            top_k=self.top_k,
-        )
-
-    def _invalidate_gpu_cache(self):
-        _pixai_invalidate_gpu_cache()

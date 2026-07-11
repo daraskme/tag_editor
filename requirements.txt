@@ -8,5 +8,6 @@ requests
 onnx>=1.17.0
 # DirectML build is Windows-only; other platforms use the standard ONNX Runtime
 # (which still picks up CUDAExecutionProvider when a GPU build is available).
-onnxruntime-directml>=1.20.0; sys_platform == 'win32'
-onnxruntime>=1.20.0; sys_platform != 'win32'
+# Pinned (not >=) for reproducible PyInstaller builds in CI.
+onnxruntime-directml==1.24.4; sys_platform == 'win32'
+onnxruntime==1.24.4; sys_platform != 'win32'

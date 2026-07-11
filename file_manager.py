@@ -1,5 +1,6 @@
 import os
 import glob
+import threading
 
 SUPPORTED_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp'}
 
@@ -10,11 +11,20 @@ class FileManager:
         self.image_files = []
         self.current_index = -1
         self._tag_counts_cache = None  # None means dirty
+        # Per-file tag cache. Shared with the batch-tagger QThread (via
+        # ai_tagger._merge_tags), hence the lock. Reflects disk state only as
+        # of the last read_tags/save_tags/load_folder call for that path --
+        # editing a .txt outside the app requires reopening the folder.
+        self._tags_cache = {}
+        self._cache_lock = threading.Lock()
+        self.last_error = None
 
     def load_folder(self, path):
         self.folder_path = path
         self.all_image_files = []
         self._tag_counts_cache = None
+        with self._cache_lock:
+            self._tags_cache = {}
 
         if not os.path.exists(path):
             return
@@ -52,13 +62,6 @@ class FileManager:
             self.current_index = -1
         return len(self.image_files)
 
-    def get_all_unique_tags(self):
-        unique_tags = set()
-        for img_path in self.all_image_files:
-            for tag in self.read_tags(img_path):
-                unique_tags.add(tag)
-        return sorted(list(unique_tags))
-
     def get_tag_counts(self):
         """Returns cached list of (tag, count) sorted by count desc then alphabetically."""
         if self._tag_counts_cache is not None:
@@ -83,28 +86,56 @@ class FileManager:
 
     def read_tags(self, image_path):
         txt_path = self.get_text_file_path(image_path)
-        if not txt_path or not os.path.exists(txt_path):
+        if not txt_path:
             return []
-        try:
-            with open(txt_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                if not content:
-                    return []
-                return [tag.strip() for tag in content.split(',') if tag.strip()]
-        except Exception:
-            return []
+
+        with self._cache_lock:
+            cached = self._tags_cache.get(image_path)
+            if cached is not None:
+                return list(cached)
+
+        if not os.path.exists(txt_path):
+            tags = []
+        else:
+            try:
+                with open(txt_path, 'rb') as f:
+                    raw = f.read()
+            except OSError:
+                return []
+            content = None
+            for enc in ('utf-8-sig', 'cp932'):
+                try:
+                    content = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if content is None:
+                # Last resort: never silently return an empty tag list for a
+                # non-empty file (the very next save would wipe it out).
+                content = raw.decode('utf-8', errors='replace')
+            content = content.strip()
+            tags = [tag.strip() for tag in content.split(',') if tag.strip()] if content else []
+
+        with self._cache_lock:
+            self._tags_cache[image_path] = list(tags)
+        return list(tags)
 
     def save_tags(self, image_path, tags):
         txt_path = self.get_text_file_path(image_path)
         if not txt_path or os.path.isdir(txt_path):
+            self.last_error = f"{txt_path}: is a directory" if txt_path else "no image path"
             return False
         try:
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write(", ".join(tags))
-            self._tag_counts_cache = None  # invalidate cache
-            return True
-        except Exception:
+        except Exception as e:
+            self.last_error = f"{txt_path}: {e}"
             return False
+        self.last_error = None
+        with self._cache_lock:
+            self._tags_cache[image_path] = list(tags)
+        self._tag_counts_cache = None  # invalidate cache
+        return True
 
     def next_image(self):
         if self.current_index < len(self.image_files) - 1:
@@ -127,8 +158,8 @@ class FileManager:
                     tags.insert(0, tag)
                 else:
                     tags.append(tag)
-                self.save_tags(img_path, tags)
-                count += 1
+                if self.save_tags(img_path, tags):
+                    count += 1
         return count
 
     def remove_tag_from_all(self, tag):
@@ -137,21 +168,20 @@ class FileManager:
             tags = self.read_tags(img_path)
             if tag in tags:
                 tags.remove(tag)
-                self.save_tags(img_path, tags)
-                count += 1
+                if self.save_tags(img_path, tags):
+                    count += 1
         return count
 
-    def replace_tag_in_all(self, old_tag, new_tag):
-        count = 0
-        new_tag = new_tag.strip() if new_tag else ""
+    def remove_tags_from_all(self, tags):
+        """Remove every tag in `tags` from all files in a single pass.
+        Returns the number of files actually updated."""
+        tag_set = {t for t in tags if t}
+        if not tag_set:
+            return 0
+        updated = 0
         for img_path in self.all_image_files:
-            tags = self.read_tags(img_path)
-            if old_tag in tags:
-                idx = tags.index(old_tag)
-                if not new_tag or new_tag in tags:
-                    tags.pop(idx)
-                else:
-                    tags[idx] = new_tag
-                self.save_tags(img_path, tags)
-                count += 1
-        return count
+            old_tags = self.read_tags(img_path)
+            new_tags = [t for t in old_tags if t not in tag_set]
+            if len(new_tags) != len(old_tags) and self.save_tags(img_path, new_tags):
+                updated += 1
+        return updated

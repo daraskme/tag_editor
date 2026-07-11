@@ -16,19 +16,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if exist "venv\.repaired_v8" goto :check_quick
+fc /b requirements.txt "venv\.reqs_installed" >nul 2>&1
+if not errorlevel 1 goto :check_quick
 
-echo [REPAIR] Starting environment fix (First time only)...
+echo [REPAIR] Installing/updating dependencies...
 python -m pip install --upgrade pip -q
-python -m pip uninstall -y torch torchvision torchaudio onnxruntime onnxruntime-gpu onnxruntime-directml transformers tokenizers dghs-imgutils 2>nul
-echo [REPAIR] Installing dependencies...
 python -m pip install -r requirements.txt --only-binary :all: -q
 if errorlevel 1 (
     echo [ERROR] Dependency installation failed.
     pause
     exit /b 1
 )
-echo done > "venv\.repaired_v8"
+copy /y requirements.txt "venv\.reqs_installed" >nul
 echo [REPAIR] Setup complete!
 
 :check_quick

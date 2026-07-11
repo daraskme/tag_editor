@@ -1,28 +1,22 @@
-import sys
 import os
 import traceback
 from PyQt6.QtGui import QPixmap, QAction, QIntValidator, QGuiApplication
-from PyQt6.QtCore import Qt, QSize, QStringListModel
+from PyQt6.QtCore import Qt, QTimer, QLocale
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSplitter, QScrollArea, QLineEdit, QFileDialog, QMessageBox,
-    QMenuBar, QInputDialog, QSizePolicy, QComboBox, QProgressBar,
+    QInputDialog, QSizePolicy, QComboBox, QProgressBar,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox,
 )
 from ui_components import FlowLayout, TagButton, ClickableImageLabel, FlowContainer
 from file_manager import FileManager
-from ai_tagger import (
-    OppaiOracleWorker, BatchOppaiOracleWorker,
-    PixAITaggerWorker, BatchPixAITaggerWorker,
-)
+from ai_tagger import OppaiOracleWorker, BatchOppaiOracleWorker
 
 COLORS = {
     "bg": "#1e1e1e",
     "sidebar": "#252526",
     "primary": "#007acc",
     "primary_hover": "#1e90ff",
-    "accent": "#9b59b6",
-    "accent_hover": "#8e44ad",
     "orange": "#e67e22",
     "orange_hover": "#d35400",
     "danger": "#c0392b",
@@ -49,6 +43,9 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
         self.file_manager = FileManager()
         self.tag_clipboard = []
+        self._src_pixmap = QPixmap()
+        self._src_pixmap_path = None
+        self._all_tags_sort = (1, Qt.SortOrder.DescendingOrder)
 
         self.setup_ui()
         self.apply_dark_theme()
@@ -154,7 +151,11 @@ class MainWindow(QMainWindow):
         search_layout.addWidget(QLabel("🔍 Filter:"))
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search by tag...")
-        self.search_input.textChanged.connect(self.filter_images)
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(300)
+        self._filter_timer.timeout.connect(lambda: self.filter_images(self.search_input.text()))
+        self.search_input.textChanged.connect(lambda _: self._filter_timer.start())
         search_layout.addWidget(self.search_input)
         left_layout.addLayout(search_layout)
 
@@ -175,7 +176,11 @@ class MainWindow(QMainWindow):
         jump_layout.addWidget(QLabel("Jump to:"))
         self.jump_input = QLineEdit()
         self.jump_input.setFixedWidth(50)
-        self.jump_input.setValidator(QIntValidator(1, 999999))
+        validator = QIntValidator(1, 999999)
+        loc = QLocale()
+        loc.setNumberOptions(loc.numberOptions() | QLocale.NumberOption.RejectGroupSeparator)
+        validator.setLocale(loc)
+        self.jump_input.setValidator(validator)
         self.jump_input.returnPressed.connect(self.jump_to_image)
         jump_layout.addWidget(self.jump_input)
 
@@ -227,28 +232,11 @@ class MainWindow(QMainWindow):
 
         # Run buttons (single image)
         run_btn_layout = QHBoxLayout()
-        self.pixai_btn = QPushButton("Run PixAI Tagger")
-        self.pixai_btn.setStyleSheet("background-color: #9b59b6; color: white; padding: 5px;")
-        self.pixai_btn.clicked.connect(self.run_pixai_tagger)
         self.oppai_btn = QPushButton("Run OppaiOracle")
         self.oppai_btn.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
         self.oppai_btn.clicked.connect(self.run_oppai_oracle)
-        run_btn_layout.addWidget(self.pixai_btn)
         run_btn_layout.addWidget(self.oppai_btn)
         ai_layout.addLayout(run_btn_layout)
-
-        # PixAI options
-        pixai_opt_layout = QHBoxLayout()
-        pixai_opt_layout.addWidget(QLabel("PixAI Threshold — General:"))
-        self.pixai_general_threshold_edit = QLineEdit("0.3")
-        self.pixai_general_threshold_edit.setFixedWidth(50)
-        pixai_opt_layout.addWidget(self.pixai_general_threshold_edit)
-        pixai_opt_layout.addWidget(QLabel("Character:"))
-        self.pixai_character_threshold_edit = QLineEdit("0.85")
-        self.pixai_character_threshold_edit.setFixedWidth(50)
-        pixai_opt_layout.addWidget(self.pixai_character_threshold_edit)
-        pixai_opt_layout.addStretch(1)
-        ai_layout.addLayout(pixai_opt_layout)
 
         # OppaiOracle options
         oppai_opt_layout = QHBoxLayout()
@@ -265,13 +253,9 @@ class MainWindow(QMainWindow):
 
         # Batch buttons
         batch_btn_layout = QHBoxLayout()
-        self.batch_pixai_btn = QPushButton("Batch Tag All (PixAI)")
-        self.batch_pixai_btn.setStyleSheet("background-color: #8e44ad; color: white; padding: 5px;")
-        self.batch_pixai_btn.clicked.connect(self.run_batch_pixai)
         self.batch_oppai_btn = QPushButton("Batch Tag All (OppaiOracle)")
         self.batch_oppai_btn.setStyleSheet("background-color: #d35400; color: white; padding: 5px;")
         self.batch_oppai_btn.clicked.connect(self.run_batch_oppai)
-        batch_btn_layout.addWidget(self.batch_pixai_btn)
         batch_btn_layout.addWidget(self.batch_oppai_btn)
         ai_layout.addLayout(batch_btn_layout)
 
@@ -385,6 +369,9 @@ class MainWindow(QMainWindow):
         self.all_tags_table.setStyleSheet(
             "QTableWidget { alternate-background-color: #252526; }"
         )
+        self.all_tags_table.horizontalHeader().sortIndicatorChanged.connect(
+            self._on_all_tags_sort_changed
+        )
         all_tab_layout.addWidget(self.all_tags_table, stretch=1)
 
         self.remove_selected_btn = QPushButton("🗑 Remove Selected Tag from All Files")
@@ -444,14 +431,19 @@ class MainWindow(QMainWindow):
             img_path = self.file_manager.get_current_image_path()
         if not img_path:
             return
-        pixmap = QPixmap(img_path)
-        if not pixmap.isNull():
-            scaled = pixmap.scaled(
+        if img_path != self._src_pixmap_path:
+            self._src_pixmap = QPixmap(img_path)
+            self._src_pixmap_path = img_path if not self._src_pixmap.isNull() else None
+        if not self._src_pixmap.isNull():
+            scaled = self._src_pixmap.scaled(
                 self.image_label.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
             self.image_label.setPixmap(scaled)
+        else:
+            self.image_label.clear()
+            self.image_label.setText("Cannot load image")
 
     # ── Image Tags tab ────────────────────────────────────────────────────────
 
@@ -484,7 +476,10 @@ class MainWindow(QMainWindow):
             tags.append(tag)
             self.file_manager.save_tags(img_path, tags)
             self.tag_input.clear()
-            self.load_tags()
+            btn = TagButton(tag)
+            btn.deleted.connect(self.remove_tag)
+            btn.edit_requested.connect(self.edit_tag)
+            self.tags_layout.addWidget(btn)
 
     def edit_tag(self, old_tag):
         img_path = self.file_manager.get_current_image_path()
@@ -513,7 +508,9 @@ class MainWindow(QMainWindow):
         if tag in tags:
             tags.remove(tag)
             self.file_manager.save_tags(img_path, tags)
-            self.load_tags()
+            # The TagButton that emitted this signal already deleteLater()s
+            # itself; Qt's ChildRemoved handling removes it from FlowLayout
+            # and triggers reflow automatically, so no rebuild is needed here.
 
     def next_image(self):
         if self.file_manager.next_image():
@@ -527,13 +524,21 @@ class MainWindow(QMainWindow):
         text = self.jump_input.text()
         if not text:
             return
-        idx = int(text) - 1
-        if 0 <= idx < len(self.file_manager.image_files):
+        total = len(self.file_manager.image_files)
+        if total == 0:
+            QMessageBox.warning(self, "No Images", "No folder is loaded yet.")
+            return
+        value, ok = QLocale().toInt(text)
+        if not ok:
+            QMessageBox.warning(self, "Invalid Index", "Please enter a valid number.")
+            return
+        idx = value - 1
+        if 0 <= idx < total:
             self.file_manager.current_index = idx
             self.update_ui()
             self.jump_input.clear()
         else:
-            QMessageBox.warning(self, "Invalid Index", f"Please enter a number between 1 and {len(self.file_manager.image_files)}.")
+            QMessageBox.warning(self, "Invalid Index", f"Please enter a number between 1 and {total}.")
 
     def clear_current_tags(self):
         img_path = self.file_manager.get_current_image_path()
@@ -577,7 +582,10 @@ class MainWindow(QMainWindow):
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             count = self.file_manager.add_tag_to_all(tag, position)
-            QMessageBox.information(self, "Success", f"Added '{tag}' to {count} files.")
+            msg = f"Added '{tag}' to {count} files."
+            if self.file_manager.last_error:
+                msg += f"\n\nSome files failed to save: {self.file_manager.last_error}"
+            QMessageBox.information(self, "Success", msg)
             self.tag_input.clear()
             self.load_tags()
 
@@ -591,7 +599,10 @@ class MainWindow(QMainWindow):
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             count = self.file_manager.remove_tag_from_all(tag)
-            QMessageBox.information(self, "Success", f"Removed '{tag}' from {count} files.")
+            msg = f"Removed '{tag}' from {count} files."
+            if self.file_manager.last_error:
+                msg += f"\n\nSome files failed to save: {self.file_manager.last_error}"
+            QMessageBox.information(self, "Success", msg)
             self.tag_input.clear()
             self.load_tags()
 
@@ -602,9 +613,12 @@ class MainWindow(QMainWindow):
             self.refresh_all_tags_table()
 
     def refresh_all_tags_table(self):
-        filter_text = self.all_tags_search.text()
         tag_counts = self.file_manager.get_tag_counts()
-        self._populate_all_tags_table(tag_counts, filter_text)
+        self._populate_all_tags_table(tag_counts)
+        self._filter_all_tags_table(self.all_tags_search.text())
+
+    def _on_all_tags_sort_changed(self, col, order):
+        self._all_tags_sort = (col, order)
 
     def _copy_frequent_tags(self):
         """Copy every tag that appears in at least N images to the clipboard.
@@ -629,29 +643,31 @@ class MainWindow(QMainWindow):
         )
 
     def _filter_all_tags_table(self, text: str):
-        tag_counts = self.file_manager.get_tag_counts()
-        self._populate_all_tags_table(tag_counts, text)
+        f = text.lower()
+        table = self.all_tags_table
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            table.setRowHidden(row, bool(f) and (item is None or f not in item.text().lower()))
 
-    def _populate_all_tags_table(self, tag_counts: list, filter_text: str = ""):
-        self.all_tags_table.setSortingEnabled(False)
-        self.all_tags_table.setRowCount(0)
+    def _populate_all_tags_table(self, tag_counts: list):
+        table = self.all_tags_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
 
-        f = filter_text.lower()
         for tag, count in tag_counts:
-            if f and f not in tag.lower():
-                continue
-            row = self.all_tags_table.rowCount()
-            self.all_tags_table.insertRow(row)
+            row = table.rowCount()
+            table.insertRow(row)
 
             tag_item = QTableWidgetItem(tag)
-            self.all_tags_table.setItem(row, 0, tag_item)
+            table.setItem(row, 0, tag_item)
 
             count_item = NumericTableWidgetItem(str(count))
             count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.all_tags_table.setItem(row, 1, count_item)
+            table.setItem(row, 1, count_item)
 
-        self.all_tags_table.setSortingEnabled(True)
-        self.all_tags_table.sortByColumn(1, Qt.SortOrder.DescendingOrder)
+        table.setSortingEnabled(True)
+        sort_col, sort_order = self._all_tags_sort
+        table.sortByColumn(sort_col, sort_order)
 
     def _remove_selected_tags(self):
         selected_rows = self.all_tags_table.selectionModel().selectedRows()
@@ -669,9 +685,12 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        total_removed = 0
-        for tag in tags:
-            total_removed += self.file_manager.remove_tag_from_all(tag)
+        total_removed = self.file_manager.remove_tags_from_all(tags)
+        if self.file_manager.last_error:
+            QMessageBox.warning(
+                self, "Warning",
+                f"一部のファイルの保存に失敗しました: {self.file_manager.last_error}",
+            )
 
         self.statusBar().showMessage(f"{len(tags)}個のタグを削除しました。({total_removed}件のファイルを更新)", 3000)
         self.load_tags()
@@ -689,10 +708,15 @@ class MainWindow(QMainWindow):
     # ── AI Tagging ────────────────────────────────────────────────────────────
 
     def set_ai_buttons_enabled(self, enabled: bool):
-        for btn in (self.pixai_btn, self.oppai_btn,
-                    self.batch_pixai_btn, self.batch_oppai_btn,
-                    self.add_all_btn, self.remove_all_btn):
-            btn.setEnabled(enabled)
+        # Includes every control that read-modify-writes a tag .txt file, so
+        # the GUI thread can't race the batch/single-tagger worker thread
+        # (which writes via ai_tagger._merge_tags) on the same file.
+        for widget in (self.oppai_btn, self.batch_oppai_btn,
+                       self.add_all_btn, self.remove_all_btn,
+                       self.tag_input, self.add_btn, self.paste_btn,
+                       self.clear_all_btn, self.remove_selected_btn,
+                       self.tags_container):
+            widget.setEnabled(enabled)
 
     @staticmethod
     def _parse_threshold(text: str, default: float) -> float:
@@ -703,12 +727,6 @@ class MainWindow(QMainWindow):
 
     def _get_oppai_threshold(self) -> float:
         return self._parse_threshold(self.oppai_threshold_edit.text(), 0.4)
-
-    def _get_pixai_thresholds(self) -> tuple:
-        return (
-            self._parse_threshold(self.pixai_general_threshold_edit.text(), 0.3),
-            self._parse_threshold(self.pixai_character_threshold_edit.text(), 0.85),
-        )
 
     def _start_single_tagger(self, worker, label: str):
         self.set_ai_buttons_enabled(False)
@@ -741,27 +759,6 @@ class MainWindow(QMainWindow):
         worker.finished.connect(self.on_batch_finished)
         worker.start()
         return True
-
-    def run_pixai_tagger(self):
-        img_path = self.file_manager.get_current_image_path()
-        if not img_path:
-            return
-        thr_general, thr_character = self._get_pixai_thresholds()
-        worker = PixAITaggerWorker(
-            img_path,
-            threshold_general=thr_general,
-            threshold_character=thr_character,
-        )
-        self._start_single_tagger(worker, "PixAI Tagger")
-
-    def run_batch_pixai(self):
-        thr_general, thr_character = self._get_pixai_thresholds()
-        worker = BatchPixAITaggerWorker(
-            self.file_manager, self.file_manager.image_files,
-            threshold_general=thr_general,
-            threshold_character=thr_character,
-        )
-        self._start_batch_tagger(worker, "PixAI Tagger")
 
     def run_oppai_oracle(self):
         img_path = self.file_manager.get_current_image_path()
@@ -816,14 +813,18 @@ class MainWindow(QMainWindow):
     def on_ai_finished(self, new_tags: list, error_msg: str):
         self.set_ai_buttons_enabled(True)
         self.statusBar().clearMessage()
+        # Resolve the target from the worker, not the current view: the user
+        # may have navigated to a different image while inference ran (which
+        # can take minutes on the first, model-downloading run).
+        worker = getattr(self, "_active_worker", None)
+        img_path = getattr(worker, "image_path", None)
         if error_msg:
             QMessageBox.critical(self, "AI Error", error_msg)
             return
+        if not img_path or not os.path.exists(img_path):
+            return
         if not new_tags:
             QMessageBox.information(self, "AI Tagger", "No tags resulted from model.")
-            return
-        img_path = self.file_manager.get_current_image_path()
-        if not img_path:
             return
         current_tags = self.file_manager.read_tags(img_path)
         added_count = 0
@@ -832,14 +833,27 @@ class MainWindow(QMainWindow):
             if tag and tag not in current_tags:
                 current_tags.append(tag)
                 added_count += 1
-        if added_count > 0:
-            self.file_manager.save_tags(img_path, current_tags)
+        if added_count == 0:
+            self.statusBar().showMessage("No new unique tags identified.", 3000)
+            return
+        self.file_manager.save_tags(img_path, current_tags)
+        if img_path == self.file_manager.get_current_image_path():
             self.load_tags()
             self.statusBar().showMessage(f"Added {added_count} new tags.", 3000)
         else:
-            self.statusBar().showMessage("No new unique tags identified.", 3000)
+            self.statusBar().showMessage(
+                f"Added {added_count} tags to {os.path.basename(img_path)}.", 4000
+            )
 
-    # ── Resize / Drag-and-Drop ────────────────────────────────────────────────
+    # ── Close / Resize / Drag-and-Drop ───────────────────────────────────────
+
+    def closeEvent(self, event):
+        for worker in (getattr(self, "_active_worker", None),
+                       getattr(self, "_active_batch_worker", None)):
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                worker.wait(10000)
+        event.accept()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
