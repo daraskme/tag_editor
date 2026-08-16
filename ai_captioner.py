@@ -161,10 +161,16 @@ class _CancelStoppingCriteria:
 
     def __call__(self, input_ids, scores, **kwargs):
         import torch
-        if self._cancel_event.is_set():
-            # Every sequence in the batch is "done" -> generate() stops.
-            return torch.ones(input_ids.shape[0], dtype=torch.bool)
-        return torch.zeros(input_ids.shape[0], dtype=torch.bool)
+        # Must be created on input_ids' device: transformers combines this
+        # with its own CUDA-resident `is_done` tensor via `is_done |
+        # criteria(...)`, and a bare torch.ones/zeros() defaults to CPU --
+        # reproduced live as "Expected all tensors to be on the same device,
+        # but found at least two devices, cuda:0 and cpu" on the very first
+        # real generate() call.
+        done = self._cancel_event.is_set()
+        return torch.full(
+            (input_ids.shape[0],), done, dtype=torch.bool, device=input_ids.device,
+        )
 
 
 def _bf16_make_tqdm_class(progress_cb):
@@ -213,21 +219,19 @@ def _bf16_make_tqdm_class(progress_cb):
 class BF16Backend(CaptionBackend):
     """AEON-7/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-BF16 via transformers + torch.
 
-    EXPERIMENTAL / UNVERIFIED END-TO-END: the load/generate code path below is
-    verified against the repo's config.json and processor metadata only
-    (architectures=["Qwen3_5ForConditionalGeneration"], model_type="qwen3_5",
-    natively resolved by transformers 5.15.0 with no trust_remote_code needed;
-    AutoProcessor resolves to Qwen3VLProcessor but requires torchvision to be
-    installed -- add it to requirements.txt). A full ~54GB weights download and
-    load has NOT been executed as part of writing this module, so treat this
-    backend as unproven relative to GGUFBackend (verified end-to-end on real
-    hardware) until someone runs it for real.
+    Verified end-to-end on real hardware (RTX PRO 6000, 96GB): a real ~54GB
+    download + load + single-image caption() call, and a real cancel() call
+    that interrupts an in-flight generate() (the CUDA/CPU device-mismatch bug
+    in _CancelStoppingCriteria that this first surfaced has been fixed).
+    NOT yet exercised through the full _BaseBatchCaptionWorker/QThread batch
+    pipeline the way GGUFBackend has been (multi-image batches, batch
+    cancellation) -- only direct single-call use has been confirmed.
     """
 
     MODEL_STATUS = (
-        "Experimental / unverified end-to-end -- config & processor metadata "
-        "checked only, a full weights load has not been run. Prefer the GGUF "
-        "backend unless you specifically need this one."
+        "Verified: real weights load + single-image caption + cancellation "
+        "confirmed working. Not yet exercised via batch captioning -- if you "
+        "hit an issue there, prefer the GGUF backend and report it."
     )
 
     REPO_ID = AEON7_REPO_ID
@@ -423,6 +427,19 @@ class BF16Backend(CaptionBackend):
         input_len = inputs["input_ids"].shape[1]
         new_tokens = output_ids[0][input_len:]
         text = self._processor.decode(new_tokens, skip_special_tokens=True).strip()
+        if not text:
+            # do_sample=True can, rarely, emit EOS (or only whitespace)
+            # immediately. GGUFBackend already guards this exact failure mode
+            # (see its docstring "Never save raw/empty text as a caption");
+            # this backend needs the same guard, since an empty return here
+            # is otherwise treated as a normal success by both worker classes
+            # and would silently wipe the image's existing .txt to empty via
+            # save_caption().
+            raise RuntimeError(
+                f"Generation produced no caption text for {image_path} "
+                "(model emitted only whitespace/EOS); refusing to save an "
+                "empty caption."
+            )
         return text
 
     def cancel(self):
@@ -504,7 +521,7 @@ class GGUFBackend(CaptionBackend):
 
     REPO_ID = GGUF_REPO_ID
 
-    def __init__(self, vram_tier="24GB", n_ctx=4096):
+    def __init__(self, vram_tier="24GB", n_ctx=8192):
         if vram_tier not in GGUF_VRAM_TIERS:
             raise ValueError(f"Unknown VRAM tier {vram_tier!r}; choose one of {list(GGUF_VRAM_TIERS)}")
         self.vram_tier = vram_tier
@@ -581,7 +598,14 @@ class GGUFBackend(CaptionBackend):
             llm = Llama(
                 model_path=quant_path,
                 chat_handler=chat_handler,
-                n_ctx=self.n_ctx,   # short-caption use case, not the model's 262144 max
+                # short-caption use case, not the model's 262144 max -- but
+                # generous enough (default 8192, not the smallest value that
+                # "worked" in testing) to cover vision tokens from a large
+                # real training image (my own testing used modest ~300-500px
+                # test images; a real LoRA dataset image can be much bigger)
+                # plus the up-to-1536-token reasoning-retry budget without
+                # the prompt+generation together approaching the ceiling.
+                n_ctx=self.n_ctx,
                 n_gpu_layers=-1,
                 verbose=False,
             )
@@ -596,7 +620,18 @@ class GGUFBackend(CaptionBackend):
             raise RuntimeError("GGUFBackend.caption() called before load()")
 
         def _is_cancelled():
-            return self._cancel_event.is_set() or (cancel_check is not None and cancel_check())
+            # Consume-on-read: self._cancel_event is set by cancel() and, per
+            # the CaptionBackend contract, should only cancel the current (or
+            # next-to-start) call, not every future one. Since this backend
+            # instance is cached and reused across the whole session (see
+            # MainWindow._get_caption_backend()), leaving the event set after
+            # observing it here would permanently break every subsequent
+            # caption() call on this instance -- clear it the moment it's
+            # observed so a fresh cancel() is needed to cancel again.
+            if self._cancel_event.is_set():
+                self._cancel_event.clear()
+                return True
+            return cancel_check is not None and cancel_check()
 
         if _is_cancelled():
             raise _Cancelled(f"Caption generation cancelled before starting for {image_path}")

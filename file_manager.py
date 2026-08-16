@@ -4,6 +4,34 @@ import threading
 
 SUPPORTED_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp'}
 
+
+def _classify_content(text):
+    """Heuristic: does `text` look like a comma-separated Danbooru-style tag
+    list, or free-text prose (an AI-generated caption)? Tags and captions
+    share the same sidecar .txt with no explicit marker recording which one
+    is currently there, so read_tags()/save_tags() use this to avoid
+    silently mangling a caption -- rendering it as bogus tag "chips",
+    polluting the All Tags tab / tag-search filter, or letting a tag-editing
+    action overwrite it with a comma-joined tag list.
+
+    Deliberately biased toward 'tags' (the pre-existing behavior) so this
+    only intervenes on content it's confident is prose: real tags are never
+    terminated with sentence punctuation and are individually short, while
+    every caption ai_captioner.py generates is 1-3 full sentences.
+    """
+    text = text.strip()
+    if not text:
+        return 'tags'
+    if text[-1] in '.!?':
+        return 'caption'
+    segments = [s.strip() for s in text.split(',') if s.strip()]
+    # A caption that (unusually) lacks terminal punctuation is still
+    # distinguishable from a tag list by shape: a few long, multi-word
+    # clauses rather than many short entries.
+    if segments and len(segments) <= 3 and all(len(s.split()) >= 5 for s in segments):
+        return 'caption'
+    return 'tags'
+
 class FileManager:
     def __init__(self):
         self.folder_path = ""
@@ -158,15 +186,33 @@ class FileManager:
 
     def read_tags(self, image_path):
         content = self._read_raw_text(image_path)
-        return [tag.strip() for tag in content.split(',') if tag.strip()] if content else []
+        if not content or _classify_content(content) == 'caption':
+            return []
+        return [tag.strip() for tag in content.split(',') if tag.strip()]
 
     def read_caption(self, image_path):
         """Read the sidecar .txt as a free-text caption (no comma-splitting).
         Tags and captions are mutually exclusive per image and share the same
-        file, so this simply returns whatever text is currently there."""
+        file, so this simply returns whatever text is currently there --
+        unlike read_tags(), this is always the raw ground truth regardless of
+        classification, since it backs the UI's "what's actually on disk"
+        preview."""
         return self._read_raw_text(image_path)
 
     def save_tags(self, image_path, tags):
+        # Refuse to comma-join a non-empty tag list over content classified
+        # as a caption -- read_tags() already reports [] for such files, so
+        # every "add/edit a tag" UI path arrives here with a *new* tag turning
+        # an (apparently) empty tag list non-empty; without this guard that
+        # silently overwrites the caption with a mangled fragment. An empty
+        # `tags` list (clearing) is still allowed through unconditionally --
+        # that's an unambiguous, explicitly-confirmed user action either way.
+        if tags and _classify_content(self._read_raw_text(image_path)) == 'caption':
+            self.last_error = (
+                f"{self.get_text_file_path(image_path)}: currently holds an AI caption, "
+                "not tags -- clear it (or edit it as a caption) before adding tags"
+            )
+            return False
         if not self._write_raw_text(image_path, ", ".join(tags)):
             return False
         self._tag_counts_cache = None  # invalidate cache

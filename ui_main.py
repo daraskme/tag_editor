@@ -296,7 +296,7 @@ class MainWindow(QMainWindow):
         caption_backend_layout.addWidget(QLabel("Backend:"))
         self.caption_backend_combo = QComboBox()
         self.caption_backend_combo.addItems([
-            "AEON-7 BF16 (this PC, experimental)", "GGUF (VRAM tier)",
+            "AEON-7 BF16 (this PC)", "GGUF (VRAM tier)",
         ])
         caption_backend_layout.addWidget(self.caption_backend_combo)
         caption_backend_layout.addWidget(QLabel("VRAM Tier:"))
@@ -305,6 +305,11 @@ class MainWindow(QMainWindow):
         caption_backend_layout.addWidget(self.caption_vram_tier_combo)
         caption_backend_layout.addStretch(1)
         caption_layout.addLayout(caption_backend_layout)
+
+        self.caption_backend_status_label = QLabel()
+        self.caption_backend_status_label.setWordWrap(True)
+        self.caption_backend_status_label.setStyleSheet("color: #999; font-size: 11px;")
+        caption_layout.addWidget(self.caption_backend_status_label)
 
         caption_style_layout = QHBoxLayout()
         caption_style_layout.addWidget(QLabel("Caption Style:"))
@@ -347,7 +352,19 @@ class MainWindow(QMainWindow):
         self.caption_backend_combo.currentIndexChanged.connect(self._save_caption_settings)
         self.caption_vram_tier_combo.currentIndexChanged.connect(self._save_caption_settings)
         self.caption_style_combo.currentTextChanged.connect(self._save_caption_settings)
-        self.caption_instruction_edit.textChanged.connect(self._save_caption_settings)
+        # Debounced, unlike the combo boxes above (whose changes are already
+        # infrequent, deliberate clicks): textChanged fires per keystroke, and
+        # _save_caption_settings ends with an explicit QSettings.sync() disk
+        # flush, so connecting it directly would sync once per character
+        # typed into a multi-sentence prompt. Reuses the same debounce
+        # pattern as self._filter_timer (search box) elsewhere in this file.
+        self._caption_settings_timer = QTimer(self)
+        self._caption_settings_timer.setSingleShot(True)
+        self._caption_settings_timer.setInterval(500)
+        self._caption_settings_timer.timeout.connect(self._save_caption_settings)
+        self.caption_instruction_edit.textChanged.connect(
+            lambda: self._caption_settings_timer.start()
+        )
 
         self._load_caption_settings()
         self._on_caption_backend_changed(self.caption_backend_combo.currentIndex())
@@ -568,7 +585,9 @@ class MainWindow(QMainWindow):
         tags = self.file_manager.read_tags(img_path)
         if tag not in tags:
             tags.append(tag)
-            self.file_manager.save_tags(img_path, tags)
+            if not self.file_manager.save_tags(img_path, tags):
+                QMessageBox.warning(self, "Warning", self.file_manager.last_error or "Failed to save tag.")
+                return
             self.tag_input.clear()
             btn = TagButton(tag)
             btn.deleted.connect(self.remove_tag)
@@ -591,7 +610,9 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(self, "Warning", "This tag already exists.")
                     return
                 tags[idx] = new_tag
-                self.file_manager.save_tags(img_path, tags)
+                if not self.file_manager.save_tags(img_path, tags):
+                    QMessageBox.warning(self, "Warning", self.file_manager.last_error or "Failed to save tag.")
+                    return
                 self.load_tags()
 
     def remove_tag(self, tag):
@@ -601,10 +622,15 @@ class MainWindow(QMainWindow):
         tags = self.file_manager.read_tags(img_path)
         if tag in tags:
             tags.remove(tag)
-            self.file_manager.save_tags(img_path, tags)
             # The TagButton that emitted this signal already deleteLater()s
-            # itself; Qt's ChildRemoved handling removes it from FlowLayout
-            # and triggers reflow automatically, so no rebuild is needed here.
+            # itself regardless of what happens below; Qt's ChildRemoved
+            # handling removes it from FlowLayout and triggers reflow
+            # automatically, so no rebuild is needed on success. On failure
+            # the button is still gone from the UI (nothing to roll back to)
+            # but the warning at least tells the user the file itself wasn't
+            # actually updated, instead of silently disagreeing with disk.
+            if not self.file_manager.save_tags(img_path, tags):
+                QMessageBox.warning(self, "Warning", self.file_manager.last_error or "Failed to save tag.")
 
     def next_image(self):
         if self.file_manager.next_image():
@@ -660,7 +686,9 @@ class MainWindow(QMainWindow):
                     current_tags.append(tag)
                     added = True
             if added:
-                self.file_manager.save_tags(img_path, current_tags)
+                if not self.file_manager.save_tags(img_path, current_tags):
+                    QMessageBox.warning(self, "Warning", self.file_manager.last_error or "Failed to save tags.")
+                    return
                 self.load_tags()
                 self.statusBar().showMessage(f"Pasted {len(self.tag_clipboard)} tags", 2000)
 
@@ -956,9 +984,13 @@ class MainWindow(QMainWindow):
     # ── AI Captioning ─────────────────────────────────────────────────────────
 
     def _on_caption_backend_changed(self, _index):
-        self.caption_vram_tier_combo.setEnabled(
-            self.caption_backend_combo.currentText() == "GGUF (VRAM tier)"
-        )
+        is_gguf = self.caption_backend_combo.currentText() == "GGUF (VRAM tier)"
+        self.caption_vram_tier_combo.setEnabled(is_gguf)
+        # MODEL_STATUS is a class-level constant -- read it directly, no need
+        # to instantiate (and thus potentially trigger a download of) the
+        # backend just to show its status text.
+        status_cls = GGUFBackend if is_gguf else BF16Backend
+        self.caption_backend_status_label.setText(status_cls.MODEL_STATUS)
 
     def _on_caption_style_changed(self, text):
         if text == "Character LoRA":
@@ -1012,7 +1044,11 @@ class MainWindow(QMainWindow):
                     self.caption_style_combo.setCurrentIndex(idx)
 
         with QSignalBlocker(self.caption_instruction_edit):
-            if instruction:
+            # is not None, not a truthiness check: an intentionally-cleared
+            # (empty-string) instruction is a real saved value and must be
+            # restored as empty, not silently fall back to the widget's
+            # construction-time CHARACTER_LORA_PROMPT default.
+            if instruction is not None:
                 self.caption_instruction_edit.setPlainText(instruction)
 
     def _get_caption_backend(self):

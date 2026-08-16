@@ -55,7 +55,7 @@ GPUが検知されない環境では、自動的にCPUモードで動作しま�
 
 ### バックエンドの選択
 
-- **AEON-7 BF16（このPC専用・実験的）**: `AEON-7/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-BF16`（約54GB、BF16精度）をフルサイズで実行します。48GB以上のVRAMを搭載したGPU（例: RTX PRO 6000）が必要です。設定・チャットテンプレートの検証は行っていますが、実際に54GBの重みをロードしての動作確認はまだ行っていないため、UI上も「experimental」と表示されます。
+- **AEON-7 BF16（このPC専用）**: `AEON-7/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-BF16`（約54GB、BF16精度）をフルサイズで実行します。48GB以上のVRAMを搭載したGPU（例: RTX PRO 6000）が必要です。実機で54GBのダウンロード・ロード・単体画像でのキャプション生成・キャンセルの動作を確認済みです。ただし、フォルダ一括生成（Batch Caption All）のワーカースレッド経由での動作はまだ検証していないため、複数枚をまとめて処理する場合はGGUFバックエンドの方が実績があります。
 - **GGUF（VRAMティア選択）**: `JonathanColetti/Qwen3.8-27B-Uncensored-GGUF` の量子化版を、お使いのVRAM量に応じて選択します（NVIDIA/CUDAのみ対応）。実機（RTX PRO 6000）で動作検証済みです。
 
   | VRAMティア | 量子化ファイル | 目安サイズ |
