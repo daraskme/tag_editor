@@ -11,11 +11,17 @@ class FileManager:
         self.image_files = []
         self.current_index = -1
         self._tag_counts_cache = None  # None means dirty
-        # Per-file tag cache. Shared with the batch-tagger QThread (via
-        # ai_tagger._merge_tags), hence the lock. Reflects disk state only as
-        # of the last read_tags/save_tags/load_folder call for that path --
-        # editing a .txt outside the app requires reopening the folder.
-        self._tags_cache = {}
+        # Per-file *raw text* cache, shared by the tag (comma-split) and
+        # caption (free text) read/write paths, and with the batch-tagger/
+        # batch-captioner QThread workers (via ai_tagger._merge_tags /
+        # save_caption), hence the lock. A single cache -- not two separate
+        # ones -- because tags and captions are mutually exclusive per image
+        # and share the same .txt file; two independent caches could desync
+        # when one feature overwrites what the other last wrote. Reflects
+        # disk state only as of the last read/save/load_folder call for that
+        # path -- editing a .txt outside the app requires reopening the
+        # folder.
+        self._text_cache = {}
         self._cache_lock = threading.Lock()
         self.last_error = None
 
@@ -24,7 +30,7 @@ class FileManager:
         self.all_image_files = []
         self._tag_counts_cache = None
         with self._cache_lock:
-            self._tags_cache = {}
+            self._text_cache = {}
 
         if not os.path.exists(path):
             return
@@ -84,24 +90,30 @@ class FileManager:
         base, _ = os.path.splitext(image_path)
         return base + ".txt"
 
-    def read_tags(self, image_path):
+    def _read_raw_text(self, image_path):
+        """Read the sidecar .txt's full content as one stripped string,
+        regardless of whether it holds comma-separated tags or a free-text
+        caption. Cached (see _text_cache); never silently returns "" for a
+        non-empty file whose encoding is unrecognized (the next save would
+        wipe it out) -- falls back to utf-8 with lossy replacement instead.
+        """
         txt_path = self.get_text_file_path(image_path)
         if not txt_path:
-            return []
+            return ""
 
         with self._cache_lock:
-            cached = self._tags_cache.get(image_path)
+            cached = self._text_cache.get(image_path)
             if cached is not None:
-                return list(cached)
+                return cached
 
         if not os.path.exists(txt_path):
-            tags = []
+            content = ""
         else:
             try:
                 with open(txt_path, 'rb') as f:
                     raw = f.read()
             except OSError:
-                return []
+                return ""
             content = None
             for enc in ('utf-8-sig', 'cp932'):
                 try:
@@ -110,31 +122,63 @@ class FileManager:
                 except UnicodeDecodeError:
                     continue
             if content is None:
-                # Last resort: never silently return an empty tag list for a
-                # non-empty file (the very next save would wipe it out).
                 content = raw.decode('utf-8', errors='replace')
             content = content.strip()
-            tags = [tag.strip() for tag in content.split(',') if tag.strip()] if content else []
 
         with self._cache_lock:
-            self._tags_cache[image_path] = list(tags)
-        return list(tags)
+            self._text_cache[image_path] = content
+        return content
 
-    def save_tags(self, image_path, tags):
+    def _write_raw_text(self, image_path, text):
+        """Atomically write `text` as the sidecar .txt's full content (temp
+        file + os.replace), so a crash or interruption mid-write can't
+        corrupt/truncate a file that an AI feature is about to overwrite
+        wholesale."""
         txt_path = self.get_text_file_path(image_path)
         if not txt_path or os.path.isdir(txt_path):
             self.last_error = f"{txt_path}: is a directory" if txt_path else "no image path"
             return False
+        tmp_path = txt_path + ".tmp"
         try:
-            with open(txt_path, 'w', encoding='utf-8') as f:
-                f.write(", ".join(tags))
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            os.replace(tmp_path, txt_path)
         except Exception as e:
             self.last_error = f"{txt_path}: {e}"
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
             return False
         self.last_error = None
         with self._cache_lock:
-            self._tags_cache[image_path] = list(tags)
+            self._text_cache[image_path] = text
+        return True
+
+    def read_tags(self, image_path):
+        content = self._read_raw_text(image_path)
+        return [tag.strip() for tag in content.split(',') if tag.strip()] if content else []
+
+    def read_caption(self, image_path):
+        """Read the sidecar .txt as a free-text caption (no comma-splitting).
+        Tags and captions are mutually exclusive per image and share the same
+        file, so this simply returns whatever text is currently there."""
+        return self._read_raw_text(image_path)
+
+    def save_tags(self, image_path, tags):
+        if not self._write_raw_text(image_path, ", ".join(tags)):
+            return False
         self._tag_counts_cache = None  # invalidate cache
+        return True
+
+    def save_caption(self, image_path, text):
+        """Write a free-text caption, replacing whatever tags/caption were
+        previously in the sidecar .txt for this image."""
+        if not self._write_raw_text(image_path, text.strip()):
+            return False
+        self._tag_counts_cache = None  # invalidate cache: old tag counts may
+        # have included tags from this file's previous (non-caption) content
         return True
 
     def next_image(self):

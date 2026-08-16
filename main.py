@@ -6,6 +6,27 @@ from PyQt6.QtWidgets import QApplication
 from ui_main import MainWindow
 
 
+def _relax_console_encoding_errors():
+    """Running from source (not frozen) on a non-UTF-8 Windows console (e.g.
+    cp932 on Japanese Windows) leaves sys.stdout/stderr unable to encode
+    characters outside that codepage. A worker thread's own diagnostic
+    print(..., file=sys.stderr) call hitting an unencodable character (far
+    more likely with LLM-generated caption prose -- em/en dashes, curly
+    quotes -- than the short tag words this app used to only ever print)
+    would then raise UnicodeEncodeError *inside* a QThread.run(), which Qt
+    swallows silently: the thread just stops without ever emitting its
+    finished signal, leaving the UI stuck in "processing" state with no
+    error shown. Reconfiguring both streams to degrade to an escaped
+    representation instead of raising closes that hang for every print in
+    the app, not just newly-added ones."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="backslashreplace")
+            except Exception:
+                pass
+
+
 def _setup_frozen_logging():
     """A PyInstaller --windowed build has no console, so sys.stdout/stderr
     are None; any stray print() or traceback would raise AttributeError
@@ -26,6 +47,7 @@ def _setup_frozen_logging():
 
 def main():
     _setup_frozen_logging()
+    _relax_console_encoding_errors()
     app = QApplication(sys.argv)
 
     # Apply basic styling

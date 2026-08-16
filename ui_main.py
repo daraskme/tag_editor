@@ -1,16 +1,22 @@
 import os
 import traceback
 from PyQt6.QtGui import QPixmap, QAction, QIntValidator, QGuiApplication
-from PyQt6.QtCore import Qt, QTimer, QLocale
+from PyQt6.QtCore import Qt, QTimer, QLocale, QSettings, QSignalBlocker
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSplitter, QScrollArea, QLineEdit, QFileDialog, QMessageBox,
     QInputDialog, QSizePolicy, QComboBox, QProgressBar,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox,
+    QTextEdit,
 )
 from ui_components import FlowLayout, TagButton, ClickableImageLabel, FlowContainer
 from file_manager import FileManager
 from ai_tagger import OppaiOracleWorker, BatchOppaiOracleWorker
+from ai_captioner import (
+    BF16Backend, GGUFBackend, GGUF_VRAM_TIERS,
+    _BaseBatchCaptionWorker, _BaseSingleCaptionWorker,
+)
+from download_utils import _cache_dir
 
 COLORS = {
     "bg": "#1e1e1e",
@@ -24,6 +30,21 @@ COLORS = {
     "text": "#cccccc",
     "inactive": "#3e3e42",
 }
+
+CHARACTER_LORA_PROMPT = (
+    "Describe this image in natural, flowing sentences for LoRA training. Focus on pose, "
+    "facial expression, clothing, accessories, actions, camera angle/framing, background, and "
+    "lighting. Do NOT describe the character's inherent physical traits (hair color/style, eye "
+    "color, face shape, body type, species/race) -- assume those are already known and should "
+    "not be re-described. Keep it concise and objective, 1-3 sentences."
+)
+STYLE_LORA_PROMPT = (
+    "Describe this image in natural, flowing sentences for LoRA training. Focus on the subject "
+    "matter and content: what characters/objects/scenery are present, and their pose, action, "
+    "and composition. Do NOT describe the artistic style itself (art style, rendering "
+    "technique, line quality, color palette, shading, medium) -- assume the style is already "
+    "known and should not be re-described. Keep it concise and objective, 1-3 sentences."
+)
 
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -46,6 +67,9 @@ class MainWindow(QMainWindow):
         self._src_pixmap = QPixmap()
         self._src_pixmap_path = None
         self._all_tags_sort = (1, Qt.SortOrder.DescendingOrder)
+        self._settings = QSettings(
+            os.path.join(_cache_dir(""), "ui_settings.ini"), QSettings.Format.IniFormat,
+        )
 
         self.setup_ui()
         self.apply_dark_theme()
@@ -261,6 +285,73 @@ class MainWindow(QMainWindow):
 
         image_tab_layout.addLayout(ai_layout)
 
+        # AI Caption controls
+        caption_layout = QVBoxLayout()
+
+        caption_header = QLabel("AI Caption (Natural Language)")
+        caption_header.setStyleSheet("font-size: 16px; font-weight: bold;")
+        caption_layout.addWidget(caption_header)
+
+        caption_backend_layout = QHBoxLayout()
+        caption_backend_layout.addWidget(QLabel("Backend:"))
+        self.caption_backend_combo = QComboBox()
+        self.caption_backend_combo.addItems([
+            "AEON-7 BF16 (this PC, experimental)", "GGUF (VRAM tier)",
+        ])
+        caption_backend_layout.addWidget(self.caption_backend_combo)
+        caption_backend_layout.addWidget(QLabel("VRAM Tier:"))
+        self.caption_vram_tier_combo = QComboBox()
+        self.caption_vram_tier_combo.addItems(list(GGUF_VRAM_TIERS.keys()))
+        caption_backend_layout.addWidget(self.caption_vram_tier_combo)
+        caption_backend_layout.addStretch(1)
+        caption_layout.addLayout(caption_backend_layout)
+
+        caption_style_layout = QHBoxLayout()
+        caption_style_layout.addWidget(QLabel("Caption Style:"))
+        self.caption_style_combo = QComboBox()
+        self.caption_style_combo.addItems(["Character LoRA", "Style LoRA", "Custom"])
+        caption_style_layout.addWidget(self.caption_style_combo)
+        caption_style_layout.addStretch(1)
+        caption_layout.addLayout(caption_style_layout)
+
+        self.caption_instruction_edit = QTextEdit()
+        self.caption_instruction_edit.setMaximumHeight(70)
+        self.caption_instruction_edit.setPlainText(CHARACTER_LORA_PROMPT)
+        caption_layout.addWidget(self.caption_instruction_edit)
+
+        caption_run_btn_layout = QHBoxLayout()
+        self.caption_btn = QPushButton("Run Caption")
+        self.caption_btn.setStyleSheet(f"background-color: {COLORS['primary']}; color: white; padding: 5px;")
+        self.caption_btn.clicked.connect(self.run_caption)
+        caption_run_btn_layout.addWidget(self.caption_btn)
+        caption_layout.addLayout(caption_run_btn_layout)
+
+        caption_batch_btn_layout = QHBoxLayout()
+        self.batch_caption_btn = QPushButton("Batch Caption All")
+        self.batch_caption_btn.setStyleSheet(f"background-color: {COLORS['danger']}; color: white; padding: 5px;")
+        self.batch_caption_btn.clicked.connect(self.run_batch_caption)
+        caption_batch_btn_layout.addWidget(self.batch_caption_btn)
+        caption_layout.addLayout(caption_batch_btn_layout)
+
+        raw_preview_label = QLabel("Raw .txt Preview:")
+        caption_layout.addWidget(raw_preview_label)
+        self.raw_text_preview = QTextEdit()
+        self.raw_text_preview.setReadOnly(True)
+        self.raw_text_preview.setMaximumHeight(70)
+        caption_layout.addWidget(self.raw_text_preview)
+
+        image_tab_layout.addLayout(caption_layout)
+
+        self.caption_backend_combo.currentIndexChanged.connect(self._on_caption_backend_changed)
+        self.caption_style_combo.currentTextChanged.connect(self._on_caption_style_changed)
+        self.caption_backend_combo.currentIndexChanged.connect(self._save_caption_settings)
+        self.caption_vram_tier_combo.currentIndexChanged.connect(self._save_caption_settings)
+        self.caption_style_combo.currentTextChanged.connect(self._save_caption_settings)
+        self.caption_instruction_edit.textChanged.connect(self._save_caption_settings)
+
+        self._load_caption_settings()
+        self._on_caption_backend_changed(self.caption_backend_combo.currentIndex())
+
         # Batch progress (hidden by default)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -418,6 +509,7 @@ class MainWindow(QMainWindow):
             self.filename_label.setText("No image loaded")
             self.counter_label.setText("0 / 0")
             self.clear_tags()
+            self.raw_text_preview.clear()
             return
 
         current = self.file_manager.current_index + 1
@@ -451,12 +543,14 @@ class MainWindow(QMainWindow):
         self.clear_tags()
         img_path = self.file_manager.get_current_image_path()
         if not img_path:
+            self.raw_text_preview.clear()
             return
         for tag in self.file_manager.read_tags(img_path):
             btn = TagButton(tag)
             btn.deleted.connect(self.remove_tag)
             btn.edit_requested.connect(self.edit_tag)
             self.tags_layout.addWidget(btn)
+        self.raw_text_preview.setPlainText(self.file_manager.read_caption(img_path))
 
     def clear_tags(self):
         for i in reversed(range(self.tags_layout.count())):
@@ -708,15 +802,29 @@ class MainWindow(QMainWindow):
     # ── AI Tagging ────────────────────────────────────────────────────────────
 
     def set_ai_buttons_enabled(self, enabled: bool):
-        # Includes every control that read-modify-writes a tag .txt file, so
-        # the GUI thread can't race the batch/single-tagger worker thread
-        # (which writes via ai_tagger._merge_tags) on the same file.
+        # Includes every control that read-modify-writes the shared .txt
+        # sidecar, so the GUI thread can't race a worker thread writing to it
+        # -- the tagger (via ai_tagger._merge_tags) and the captioner (via
+        # file_manager.save_caption) both read-modify-write the SAME file per
+        # image, so an AI operation of either kind running must block the
+        # other kind from starting too, not just another instance of itself.
         for widget in (self.oppai_btn, self.batch_oppai_btn,
                        self.add_all_btn, self.remove_all_btn,
                        self.tag_input, self.add_btn, self.paste_btn,
                        self.clear_all_btn, self.remove_selected_btn,
-                       self.tags_container):
+                       self.tags_container,
+                       self.caption_btn, self.batch_caption_btn,
+                       self.caption_backend_combo, self.caption_style_combo,
+                       self.caption_instruction_edit):
             widget.setEnabled(enabled)
+        if enabled:
+            # caption_vram_tier_combo is intentionally handled outside the
+            # tuple above (not omitted by mistake): unconditionally
+            # re-enabling it here would break the GGUF-only-enabled
+            # invariant, so re-derive its correct state instead.
+            self._on_caption_backend_changed(self.caption_backend_combo.currentIndex())
+        else:
+            self.caption_vram_tier_combo.setEnabled(False)
 
     @staticmethod
     def _parse_threshold(text: str, default: float) -> float:
@@ -845,11 +953,205 @@ class MainWindow(QMainWindow):
                 f"Added {added_count} tags to {os.path.basename(img_path)}.", 4000
             )
 
+    # ── AI Captioning ─────────────────────────────────────────────────────────
+
+    def _on_caption_backend_changed(self, _index):
+        self.caption_vram_tier_combo.setEnabled(
+            self.caption_backend_combo.currentText() == "GGUF (VRAM tier)"
+        )
+
+    def _on_caption_style_changed(self, text):
+        if text == "Character LoRA":
+            self.caption_instruction_edit.setPlainText(CHARACTER_LORA_PROMPT)
+        elif text == "Style LoRA":
+            self.caption_instruction_edit.setPlainText(STYLE_LORA_PROMPT)
+
+    def _save_caption_settings(self):
+        self._settings.setValue("caption/backend_index", self.caption_backend_combo.currentIndex())
+        self._settings.setValue("caption/vram_tier", self.caption_vram_tier_combo.currentText())
+        self._settings.setValue("caption/style", self.caption_style_combo.currentText())
+        self._settings.setValue("caption/instruction", self.caption_instruction_edit.toPlainText())
+        # Force an immediate disk write (QSettings otherwise batches/delays
+        # this) so a crash right after a change doesn't lose it -- this is
+        # the save-on-change path's whole point vs. relying on closeEvent
+        # alone.
+        self._settings.sync()
+
+    def _load_caption_settings(self):
+        # Read all four values up front, before touching any widget: setting
+        # one combo below would otherwise fire its currentIndexChanged ->
+        # _save_caption_settings and re-save the *other* three settings using
+        # their still-default widget values, clobbering the saved values this
+        # method hasn't applied yet. Signals are also blocked below as a
+        # second layer of protection (and to stop _on_caption_style_changed
+        # from stomping a saved "Custom" instruction on the way in).
+        backend_index = self._settings.value("caption/backend_index", None)
+        vram_tier = self._settings.value("caption/vram_tier", None)
+        style = self._settings.value("caption/style", None)
+        instruction = self._settings.value("caption/instruction", None)
+
+        with QSignalBlocker(self.caption_backend_combo):
+            if backend_index is not None:
+                try:
+                    idx = int(backend_index)
+                    if 0 <= idx < self.caption_backend_combo.count():
+                        self.caption_backend_combo.setCurrentIndex(idx)
+                except (TypeError, ValueError):
+                    pass
+
+        with QSignalBlocker(self.caption_vram_tier_combo):
+            if vram_tier:
+                idx = self.caption_vram_tier_combo.findText(vram_tier)
+                if idx >= 0:
+                    self.caption_vram_tier_combo.setCurrentIndex(idx)
+
+        with QSignalBlocker(self.caption_style_combo):
+            if style:
+                idx = self.caption_style_combo.findText(style)
+                if idx >= 0:
+                    self.caption_style_combo.setCurrentIndex(idx)
+
+        with QSignalBlocker(self.caption_instruction_edit):
+            if instruction:
+                self.caption_instruction_edit.setPlainText(instruction)
+
+    def _get_caption_backend(self):
+        backend_choice = self.caption_backend_combo.currentText()
+        vram_tier = self.caption_vram_tier_combo.currentText()
+        key = (backend_choice, vram_tier)
+        if getattr(self, "_caption_backend_key", None) == key and getattr(self, "_caption_backend", None) is not None:
+            return self._caption_backend
+
+        old_backend = getattr(self, "_caption_backend", None)
+        if old_backend is not None:
+            try:
+                old_backend.close()
+            except Exception:
+                pass
+
+        if backend_choice == "GGUF (VRAM tier)":
+            backend = GGUFBackend(vram_tier=vram_tier)
+        else:
+            backend = BF16Backend()
+        self._caption_backend = backend
+        self._caption_backend_key = key
+        return backend
+
+    def _get_caption_instruction(self) -> str:
+        text = self.caption_instruction_edit.toPlainText().strip()
+        return text if text else CHARACTER_LORA_PROMPT
+
+    def _start_single_captioner(self, worker):
+        self.set_ai_buttons_enabled(False)
+        self.statusBar().showMessage("Initializing captioner...")
+        self._active_caption_worker = worker  # keep a reference so it isn't GC'd
+        worker.progress.connect(self.update_status)
+        worker.finished.connect(self.on_caption_finished)
+        worker.start()
+
+    def _start_batch_captioner(self, worker):
+        if not self.file_manager.image_files:
+            QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
+            return False
+        reply = QMessageBox.question(
+            self, "Confirm",
+            f"Run AI captioning on all {len(self.file_manager.image_files)} images?\n\n"
+            "This will REPLACE each image's existing tags/caption with a newly generated "
+            "caption. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+
+        self.set_ai_buttons_enabled(False)
+        self.progress_bar.setVisible(True)
+        self.batch_status_label.setVisible(True)
+        self.cancel_batch_btn.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(self.file_manager.image_files))
+        self._active_batch_worker = worker
+        worker.progress.connect(self.update_batch_progress)
+        worker.finished.connect(self.on_caption_batch_finished)
+        worker.start()
+        return True
+
+    def run_caption(self):
+        img_path = self.file_manager.get_current_image_path()
+        if not img_path:
+            return
+        try:
+            backend = self._get_caption_backend()
+        except Exception as e:
+            QMessageBox.critical(self, "Captioning Error", str(e))
+            return
+        worker = _BaseSingleCaptionWorker(img_path, backend, self._get_caption_instruction())
+        self._start_single_captioner(worker)
+
+    def run_batch_caption(self):
+        if not self.file_manager.image_files:
+            QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
+            return
+        try:
+            backend = self._get_caption_backend()
+        except Exception as e:
+            QMessageBox.critical(self, "Captioning Error", str(e))
+            return
+        worker = _BaseBatchCaptionWorker(
+            self.file_manager, self.file_manager.image_files, backend,
+            self._get_caption_instruction(),
+        )
+        self._start_batch_captioner(worker)
+
+    def on_caption_finished(self, caption_text: str, error_msg: str):
+        self.set_ai_buttons_enabled(True)
+        self.statusBar().clearMessage()
+        # Resolve the target from the worker, not the current view: the user
+        # may have navigated to a different image while generation ran.
+        worker = getattr(self, "_active_caption_worker", None)
+        img_path = getattr(worker, "image_path", None)
+        if error_msg:
+            if error_msg == "Cancelled":
+                QMessageBox.information(self, "AI Caption", "Captioning cancelled.")
+            else:
+                QMessageBox.critical(self, "AI Caption Error", error_msg)
+            return
+        if not img_path or not os.path.exists(img_path):
+            return
+        if not self.file_manager.save_caption(img_path, caption_text):
+            QMessageBox.critical(
+                self, "AI Caption Error",
+                f"Failed to save caption: {self.file_manager.last_error}",
+            )
+            return
+        if img_path == self.file_manager.get_current_image_path():
+            self.load_tags()
+            self.statusBar().showMessage("Caption saved.", 3000)
+        else:
+            self.statusBar().showMessage(
+                f"Caption saved for {os.path.basename(img_path)}.", 4000
+            )
+
+    def on_caption_batch_finished(self, success_count: int, total: int, error_msg: str):
+        self.set_ai_buttons_enabled(True)
+        self.progress_bar.setVisible(False)
+        self.batch_status_label.setVisible(False)
+        self.cancel_batch_btn.setVisible(False)
+        self.cancel_batch_btn.setEnabled(True)
+        self.statusBar().clearMessage()
+        if error_msg:
+            QMessageBox.critical(self, "Batch Caption Error", error_msg)
+        else:
+            QMessageBox.information(self, "Batch Caption Complete",
+                                    f"Successfully captioned {success_count} out of {total} images.")
+        self.load_tags()
+
     # ── Close / Resize / Drag-and-Drop ───────────────────────────────────────
 
     def closeEvent(self, event):
+        self._save_caption_settings()
         for worker in (getattr(self, "_active_worker", None),
-                       getattr(self, "_active_batch_worker", None)):
+                       getattr(self, "_active_batch_worker", None),
+                       getattr(self, "_active_caption_worker", None)):
             if worker is not None and worker.isRunning():
                 worker.requestInterruption()
                 worker.wait(10000)

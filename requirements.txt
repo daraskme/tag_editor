@@ -11,3 +11,50 @@ onnx>=1.17.0
 # Pinned (not >=) for reproducible PyInstaller builds in CI.
 onnxruntime-directml==1.24.4; sys_platform == 'win32'
 onnxruntime==1.24.4; sys_platform != 'win32'
+
+# ── AI Captioner (ai_captioner.py): local VLM natural-language captioning ──
+# CUDA-only (NVIDIA), matches this project's confirmed target hardware. These
+# are heavy (multi-GB) and only imported lazily inside ai_captioner.py, so app
+# startup and every other feature are unaffected if a user never installs
+# this section.
+#
+# Deliberately NOT plain `pip install`-able lines in this file, on top of the
+# per-package reasons below: this file is also what `tag_editor_run.bat` and
+# the CI release workflow (`pip install -r requirements.txt pyinstaller`) use
+# for the base app and every packaged .exe release. Auto-installing multi-GB
+# CUDA packages here would silently bloat every install and every release
+# build for users who never touch captioning, and would require the CI
+# runner to have a matching NVIDIA GPU/CUDA toolkit just to build the .exe.
+# Install these yourself, only if you want the captioning feature:
+#
+# torch/torchvision: must come from the PyTorch CUDA wheel index, not plain
+# PyPI (PyPI's torch is CPU-only on Windows).
+#   pip install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+# cu130 was chosen because it is required for Blackwell (RTX 50-series / RTX
+# PRO 6000) support; verified working on RTX PRO 6000 96GB. If your GPU is
+# older (Turing/Ampere/Ada), an older cuXXX index (e.g. cu124) also works --
+# match whichever index your `nvidia-smi` CUDA Version supports.
+#
+# transformers/accelerate: required for the BF16 backend.
+# transformers must be >= 5.12 for AutoModelForImageTextToText to recognize
+# the AEON-7 repo's "qwen3_5" architecture (its config.json declares
+# transformers_version 5.12.1).
+#   pip install "transformers>=5.12" "accelerate>=1.0"
+#
+# llama-cpp-python: needed for the GGUF/VRAM-tier backend. Prefer the
+# project's own official prebuilt CUDA wheel index over an arbitrary
+# third-party one, for supply-chain trust:
+#   pip install llama-cpp-python --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+# This works for most NVIDIA GPUs (Turing/Ampere/Ada). A bare
+# `pip install llama-cpp-python` from plain PyPI silently installs a
+# CPU-only build, which would defeat the point without any obvious error --
+# always install it via the CUDA index above, not plain PyPI.
+# Blackwell (RTX 50-series / RTX PRO 6000) is new enough that the prebuilt
+# wheel above may not include its GPU kernels; if `import llama_cpp` loads
+# but inference silently falls back to CPU (very slow) or errors about an
+# unsupported compute capability, build from source instead (verified
+# working on RTX PRO 6000 96GB, VS2022 Build Tools + CUDA 13.3 toolkit
+# required, ~10 minute compile):
+#   set CMAKE_ARGS=-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native
+#   set FORCE_CMAKE=1
+#   pip install llama-cpp-python --no-cache-dir --force-reinstall
