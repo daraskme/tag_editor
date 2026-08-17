@@ -11,9 +11,10 @@ from PyQt6.QtWidgets import (
 )
 from ui_components import FlowLayout, TagButton, ClickableImageLabel, FlowContainer
 from file_manager import FileManager
-from ai_tagger import OppaiOracleWorker, BatchOppaiOracleWorker
+from ai_tagger import OppaiOracleWorker, BatchOppaiOracleWorker, oppai_model_info
 from ai_captioner import (
-    BF16Backend, GGUFBackend, GGUF_VRAM_TIERS,
+    BF16Backend, GGUFBackend, BF16_VRAM_TIER, CAPTION_VRAM_TIERS,
+    caption_model_info, default_caption_vram_tier,
     _BaseBatchCaptionWorker, _BaseSingleCaptionWorker,
 )
 from download_utils import _cache_dir
@@ -251,18 +252,29 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidget(self.tags_container)
         image_tab_layout.addWidget(self.scroll_area, stretch=1)
 
-        # AI controls
-        ai_layout = QVBoxLayout()
+        # ── Caption mode: tags (OppaiOracle) vs natural language (Qwen3.8) ──
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("キャプションモード:"))
+        self.caption_mode_combo = QComboBox()
+        self.caption_mode_combo.addItems([
+            "タグキャプション (OppaiOracle)",
+            "自然言語キャプション (Qwen3.8)",
+        ])
+        mode_layout.addWidget(self.caption_mode_combo, stretch=1)
+        image_tab_layout.addLayout(mode_layout)
 
-        # Run buttons (single image)
+        # Tag mode panel (OppaiOracle)
+        self.tag_mode_widget = QWidget()
+        ai_layout = QVBoxLayout(self.tag_mode_widget)
+        ai_layout.setContentsMargins(0, 0, 0, 0)
+
         run_btn_layout = QHBoxLayout()
-        self.oppai_btn = QPushButton("Run OppaiOracle")
+        self.oppai_btn = QPushButton("タグキャプションを実行 (OppaiOracle)")
         self.oppai_btn.setStyleSheet("background-color: #e67e22; color: white; padding: 5px;")
         self.oppai_btn.clicked.connect(self.run_oppai_oracle)
         run_btn_layout.addWidget(self.oppai_btn)
         ai_layout.addLayout(run_btn_layout)
 
-        # OppaiOracle options
         oppai_opt_layout = QHBoxLayout()
         oppai_opt_layout.addWidget(QLabel("OppaiOracle Model:"))
         self.oppai_model_combo = QComboBox()
@@ -275,39 +287,37 @@ class MainWindow(QMainWindow):
         oppai_opt_layout.addStretch(1)
         ai_layout.addLayout(oppai_opt_layout)
 
-        # Batch buttons
+        self.oppai_status_label = QLabel()
+        self.oppai_status_label.setWordWrap(True)
+        self.oppai_status_label.setStyleSheet("color: #999; font-size: 11px;")
+        ai_layout.addWidget(self.oppai_status_label)
+
         batch_btn_layout = QHBoxLayout()
-        self.batch_oppai_btn = QPushButton("Batch Tag All (OppaiOracle)")
+        self.batch_oppai_btn = QPushButton("一括タグキャプション (OppaiOracle)")
         self.batch_oppai_btn.setStyleSheet("background-color: #d35400; color: white; padding: 5px;")
         self.batch_oppai_btn.clicked.connect(self.run_batch_oppai)
         batch_btn_layout.addWidget(self.batch_oppai_btn)
         ai_layout.addLayout(batch_btn_layout)
 
-        image_tab_layout.addLayout(ai_layout)
+        image_tab_layout.addWidget(self.tag_mode_widget)
 
-        # AI Caption controls
-        caption_layout = QVBoxLayout()
+        # Natural-language mode panel (Qwen3.8)
+        self.nl_mode_widget = QWidget()
+        caption_layout = QVBoxLayout(self.nl_mode_widget)
+        caption_layout.setContentsMargins(0, 0, 0, 0)
 
-        caption_header = QLabel("AI Caption (Natural Language)")
-        caption_header.setStyleSheet("font-size: 16px; font-weight: bold;")
-        caption_layout.addWidget(caption_header)
-
-        caption_backend_layout = QHBoxLayout()
-        caption_backend_layout.addWidget(QLabel("Backend:"))
-        self.caption_backend_combo = QComboBox()
-        self.caption_backend_combo.addItems([
-            "AEON-7 BF16 (this PC)", "GGUF (VRAM tier)",
-        ])
-        caption_backend_layout.addWidget(self.caption_backend_combo)
-        caption_backend_layout.addWidget(QLabel("VRAM Tier:"))
+        caption_vram_layout = QHBoxLayout()
+        caption_vram_layout.addWidget(QLabel("VRAM:"))
         self.caption_vram_tier_combo = QComboBox()
-        self.caption_vram_tier_combo.addItems(list(GGUF_VRAM_TIERS.keys()))
-        caption_backend_layout.addWidget(self.caption_vram_tier_combo)
-        caption_backend_layout.addStretch(1)
-        caption_layout.addLayout(caption_backend_layout)
+        self.caption_vram_tier_combo.addItems(list(CAPTION_VRAM_TIERS))
+        caption_vram_layout.addWidget(self.caption_vram_tier_combo)
+        caption_vram_layout.addStretch(1)
+        caption_layout.addLayout(caption_vram_layout)
 
         self.caption_backend_status_label = QLabel()
         self.caption_backend_status_label.setWordWrap(True)
+        self.caption_backend_status_label.setTextFormat(Qt.TextFormat.RichText)
+        self.caption_backend_status_label.setOpenExternalLinks(True)
         self.caption_backend_status_label.setStyleSheet("color: #999; font-size: 11px;")
         caption_layout.addWidget(self.caption_backend_status_label)
 
@@ -325,32 +335,34 @@ class MainWindow(QMainWindow):
         caption_layout.addWidget(self.caption_instruction_edit)
 
         caption_run_btn_layout = QHBoxLayout()
-        self.caption_btn = QPushButton("Run Caption")
+        self.caption_btn = QPushButton("自然言語キャプションを実行 (Qwen3.8)")
         self.caption_btn.setStyleSheet(f"background-color: {COLORS['primary']}; color: white; padding: 5px;")
         self.caption_btn.clicked.connect(self.run_caption)
         caption_run_btn_layout.addWidget(self.caption_btn)
         caption_layout.addLayout(caption_run_btn_layout)
 
         caption_batch_btn_layout = QHBoxLayout()
-        self.batch_caption_btn = QPushButton("Batch Caption All")
+        self.batch_caption_btn = QPushButton("一括自然言語キャプション (Qwen3.8)")
         self.batch_caption_btn.setStyleSheet(f"background-color: {COLORS['danger']}; color: white; padding: 5px;")
         self.batch_caption_btn.clicked.connect(self.run_batch_caption)
         caption_batch_btn_layout.addWidget(self.batch_caption_btn)
         caption_layout.addLayout(caption_batch_btn_layout)
 
+        image_tab_layout.addWidget(self.nl_mode_widget)
+
         raw_preview_label = QLabel("Raw .txt Preview:")
-        caption_layout.addWidget(raw_preview_label)
+        image_tab_layout.addWidget(raw_preview_label)
         self.raw_text_preview = QTextEdit()
         self.raw_text_preview.setReadOnly(True)
         self.raw_text_preview.setMaximumHeight(70)
-        caption_layout.addWidget(self.raw_text_preview)
+        image_tab_layout.addWidget(self.raw_text_preview)
 
-        image_tab_layout.addLayout(caption_layout)
-
-        self.caption_backend_combo.currentIndexChanged.connect(self._on_caption_backend_changed)
-        self.caption_style_combo.currentTextChanged.connect(self._on_caption_style_changed)
-        self.caption_backend_combo.currentIndexChanged.connect(self._save_caption_settings)
+        self.caption_mode_combo.currentIndexChanged.connect(self._on_caption_mode_changed)
+        self.caption_mode_combo.currentIndexChanged.connect(self._save_caption_settings)
+        self.caption_vram_tier_combo.currentIndexChanged.connect(self._on_caption_vram_changed)
         self.caption_vram_tier_combo.currentIndexChanged.connect(self._save_caption_settings)
+        self.oppai_model_combo.currentIndexChanged.connect(self._refresh_oppai_status_label)
+        self.caption_style_combo.currentTextChanged.connect(self._on_caption_style_changed)
         self.caption_style_combo.currentTextChanged.connect(self._save_caption_settings)
         # Debounced, unlike the combo boxes above (whose changes are already
         # infrequent, deliberate clicks): textChanged fires per keystroke, and
@@ -367,7 +379,7 @@ class MainWindow(QMainWindow):
         )
 
         self._load_caption_settings()
-        self._on_caption_backend_changed(self.caption_backend_combo.currentIndex())
+        self._on_caption_mode_changed()
 
         # Batch progress (hidden by default)
         self.progress_bar = QProgressBar()
@@ -842,15 +854,12 @@ class MainWindow(QMainWindow):
                        self.clear_all_btn, self.remove_selected_btn,
                        self.tags_container,
                        self.caption_btn, self.batch_caption_btn,
-                       self.caption_backend_combo, self.caption_style_combo,
-                       self.caption_instruction_edit):
+                       self.caption_mode_combo, self.caption_style_combo,
+                       self.caption_instruction_edit,
+                       self.oppai_model_combo, self.oppai_threshold_edit):
             widget.setEnabled(enabled)
         if enabled:
-            # caption_vram_tier_combo is intentionally handled outside the
-            # tuple above (not omitted by mistake): unconditionally
-            # re-enabling it here would break the GGUF-only-enabled
-            # invariant, so re-derive its correct state instead.
-            self._on_caption_backend_changed(self.caption_backend_combo.currentIndex())
+            self.caption_vram_tier_combo.setEnabled(self._is_natural_caption_mode())
         else:
             self.caption_vram_tier_combo.setEnabled(False)
 
@@ -866,6 +875,7 @@ class MainWindow(QMainWindow):
 
     def _start_single_tagger(self, worker, label: str):
         self.set_ai_buttons_enabled(False)
+        self._show_cancel_button()
         self.statusBar().showMessage(f"Initializing {label}...")
         self._active_worker = worker  # keep a reference so it isn't GC'd
         worker.progress.connect(self.update_status)
@@ -876,18 +886,11 @@ class MainWindow(QMainWindow):
         if not self.file_manager.image_files:
             QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
             return False
-        reply = QMessageBox.question(
-            self, "Confirm",
-            f"Run {label} on all {len(self.file_manager.image_files)} images?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return False
 
         self.set_ai_buttons_enabled(False)
         self.progress_bar.setVisible(True)
         self.batch_status_label.setVisible(True)
-        self.cancel_batch_btn.setVisible(True)
+        self._show_cancel_button()
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(len(self.file_manager.image_files))
         self._active_batch_worker = worker
@@ -901,6 +904,11 @@ class MainWindow(QMainWindow):
         if not img_path:
             return
         variant = self.oppai_model_combo.currentText()
+        if not self._confirm_model_download(
+            oppai_model_info(variant),
+            action_title="この画像にタグキャプション (OppaiOracle) を実行します。",
+        ):
+            return
         worker = OppaiOracleWorker(
             img_path,
             threshold=self._get_oppai_threshold(),
@@ -909,7 +917,16 @@ class MainWindow(QMainWindow):
         self._start_single_tagger(worker, f"OppaiOracle ({variant})")
 
     def run_batch_oppai(self):
+        if not self.file_manager.image_files:
+            QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
+            return
         variant = self.oppai_model_combo.currentText()
+        n = len(self.file_manager.image_files)
+        if not self._confirm_model_download(
+            oppai_model_info(variant),
+            action_title=f"フォルダ内の全 {n} 枚にタグキャプション (OppaiOracle) を実行します。",
+        ):
+            return
         worker = BatchOppaiOracleWorker(
             self.file_manager, self.file_manager.image_files,
             threshold=self._get_oppai_threshold(),
@@ -920,11 +937,30 @@ class MainWindow(QMainWindow):
     def update_status(self, msg: str):
         self.statusBar().showMessage(msg)
 
+    def _show_cancel_button(self):
+        self.cancel_batch_btn.setText("🛑 Cancel")
+        self.cancel_batch_btn.setVisible(True)
+        self.cancel_batch_btn.setEnabled(True)
+
+    def _hide_cancel_button(self):
+        self.cancel_batch_btn.setVisible(False)
+        self.cancel_batch_btn.setEnabled(True)
+
     def cancel_batch(self):
-        worker = getattr(self, "_active_batch_worker", None)
-        if worker is not None and worker.isRunning():
-            worker.requestInterruption()
-            self.statusBar().showMessage("Cancelling batch...")
+        interrupted = False
+        for attr in ("_active_batch_worker", "_active_worker", "_active_caption_worker"):
+            worker = getattr(self, attr, None)
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                interrupted = True
+        backend = getattr(self, "_caption_backend", None)
+        if backend is not None:
+            try:
+                backend.cancel()
+            except Exception:
+                pass
+        if interrupted:
+            self.statusBar().showMessage("Cancelling...")
         self.cancel_batch_btn.setEnabled(False)
 
     def update_batch_progress(self, current: int, total: int, filename: str):
@@ -936,8 +972,7 @@ class MainWindow(QMainWindow):
         self.set_ai_buttons_enabled(True)
         self.progress_bar.setVisible(False)
         self.batch_status_label.setVisible(False)
-        self.cancel_batch_btn.setVisible(False)
-        self.cancel_batch_btn.setEnabled(True)
+        self._hide_cancel_button()
         self.statusBar().clearMessage()
         if error_msg:
             QMessageBox.critical(self, "Batch Error", error_msg)
@@ -948,6 +983,7 @@ class MainWindow(QMainWindow):
 
     def on_ai_finished(self, new_tags: list, error_msg: str):
         self.set_ai_buttons_enabled(True)
+        self._hide_cancel_button()
         self.statusBar().clearMessage()
         # Resolve the target from the worker, not the current view: the user
         # may have navigated to a different image while inference ran (which
@@ -983,14 +1019,90 @@ class MainWindow(QMainWindow):
 
     # ── AI Captioning ─────────────────────────────────────────────────────────
 
-    def _on_caption_backend_changed(self, _index):
-        is_gguf = self.caption_backend_combo.currentText() == "GGUF (VRAM tier)"
-        self.caption_vram_tier_combo.setEnabled(is_gguf)
-        # MODEL_STATUS is a class-level constant -- read it directly, no need
-        # to instantiate (and thus potentially trigger a download of) the
-        # backend just to show its status text.
-        status_cls = GGUFBackend if is_gguf else BF16Backend
-        self.caption_backend_status_label.setText(status_cls.MODEL_STATUS)
+    def _is_natural_caption_mode(self):
+        return self.caption_mode_combo.currentIndex() == 1
+
+    def _on_caption_mode_changed(self, _index=None):
+        is_nl = self._is_natural_caption_mode()
+        self.tag_mode_widget.setVisible(not is_nl)
+        self.nl_mode_widget.setVisible(is_nl)
+        self.caption_vram_tier_combo.setEnabled(is_nl)
+        if is_nl:
+            self._on_caption_vram_changed()
+        else:
+            self._refresh_oppai_status_label()
+
+    def _refresh_oppai_status_label(self, _index=None):
+        info = oppai_model_info(self.oppai_model_combo.currentText())
+        cached = "ダウンロード済み" if info["cached"] else "未ダウンロード（初回は長時間かかります）"
+        self.oppai_status_label.setText(
+            f"{info['label']}\n{info['repo']}\n"
+            f"サイズ目安: {info['size_hint']}\n状態: {cached}"
+        )
+
+    def _on_caption_vram_changed(self, _index=None):
+        info = caption_model_info(self.caption_vram_tier_combo.currentText())
+        cached = "ダウンロード済み" if info["cached"] else "未ダウンロード（初回は長時間かかります）"
+        if info.get("runtime_ready", True):
+            runtime = "導入済み"
+        else:
+            missing = "、".join(info.get("runtime_missing") or [])
+            runtime = (
+                f"未導入（モデルと同時にダウンロード / {info.get('runtime_size_hint', '')}）"
+                f"<br>不足: {missing}"
+            )
+        self.caption_backend_status_label.setText(
+            f'{info["label"]}<br>'
+            f'<a href="{info["url"]}">{info["repo"]}</a><br>'
+            f'モデルサイズ目安: {info["size_hint"]}<br>'
+            f'モデル: {cached}<br>'
+            f'推論ランタイム: {runtime}'
+        )
+
+    def _confirm_model_download(self, info, *, action_title, extra_warning=""):
+        cached = info["cached"]
+        runtime_ready = info.get("runtime_ready", True)
+        needs_download = info.get("needs_download", not cached)
+        details = [
+            action_title,
+            "",
+            f"モデル: {info['label']}",
+            f"リポジトリ: {info['repo']}",
+            f"サイズ目安: {info['size_hint']}",
+        ]
+        if cached:
+            details += ["", "モデルはダウンロード済みです。この実行では再ダウンロードしません。"]
+        else:
+            details += [
+                "",
+                "初回は Hugging Face からモデルをダウンロードします。",
+                "ダウンロードには長時間かかります。",
+            ]
+        if not runtime_ready:
+            missing = "、".join(info.get("runtime_missing") or [])
+            details += [
+                "",
+                "推論用パッケージもモデルと同時にダウンロードします。",
+                f"不足: {missing}",
+                f"サイズ目安: {info.get('runtime_size_hint', '')}",
+                "こちらも長時間かかる場合があります。",
+            ]
+        if extra_warning:
+            details += ["", extra_warning]
+
+        box = QMessageBox(self)
+        box.setWindowTitle("DL選択（長時間かかります）")
+        box.setIcon(QMessageBox.Icon.Warning if needs_download else QMessageBox.Icon.Information)
+        box.setText("DL選択（長時間かかります）")
+        box.setInformativeText("\n".join(details))
+        accept = box.addButton(
+            "ダウンロードして実行" if needs_download else "実行",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(accept)
+        box.exec()
+        return box.clickedButton() == accept
 
     def _on_caption_style_changed(self, text):
         if text == "Character LoRA":
@@ -999,7 +1111,9 @@ class MainWindow(QMainWindow):
             self.caption_instruction_edit.setPlainText(STYLE_LORA_PROMPT)
 
     def _save_caption_settings(self):
-        self._settings.setValue("caption/backend_index", self.caption_backend_combo.currentIndex())
+        self._settings.setValue(
+            "caption/mode", "natural" if self._is_natural_caption_mode() else "tags",
+        )
         self._settings.setValue("caption/vram_tier", self.caption_vram_tier_combo.currentText())
         self._settings.setValue("caption/style", self.caption_style_combo.currentText())
         self._settings.setValue("caption/instruction", self.caption_instruction_edit.toPlainText())
@@ -1010,32 +1124,41 @@ class MainWindow(QMainWindow):
         self._settings.sync()
 
     def _load_caption_settings(self):
-        # Read all four values up front, before touching any widget: setting
+        # Read all values up front, before touching any widget: setting
         # one combo below would otherwise fire its currentIndexChanged ->
-        # _save_caption_settings and re-save the *other* three settings using
+        # _save_caption_settings and re-save the *other* settings using
         # their still-default widget values, clobbering the saved values this
         # method hasn't applied yet. Signals are also blocked below as a
         # second layer of protection (and to stop _on_caption_style_changed
         # from stomping a saved "Custom" instruction on the way in).
+        mode = self._settings.value("caption/mode", None)
         backend_index = self._settings.value("caption/backend_index", None)
         vram_tier = self._settings.value("caption/vram_tier", None)
         style = self._settings.value("caption/style", None)
         instruction = self._settings.value("caption/instruction", None)
 
-        with QSignalBlocker(self.caption_backend_combo):
-            if backend_index is not None:
-                try:
-                    idx = int(backend_index)
-                    if 0 <= idx < self.caption_backend_combo.count():
-                        self.caption_backend_combo.setCurrentIndex(idx)
-                except (TypeError, ValueError):
-                    pass
+        with QSignalBlocker(self.caption_mode_combo):
+            if mode == "natural":
+                self.caption_mode_combo.setCurrentIndex(1)
+            elif mode == "tags":
+                self.caption_mode_combo.setCurrentIndex(0)
 
         with QSignalBlocker(self.caption_vram_tier_combo):
-            if vram_tier:
-                idx = self.caption_vram_tier_combo.findText(vram_tier)
-                if idx >= 0:
-                    self.caption_vram_tier_combo.setCurrentIndex(idx)
+            selected = None
+            if vram_tier in CAPTION_VRAM_TIERS:
+                selected = vram_tier
+            elif backend_index is not None:
+                # Older builds stored 0=BF16 / 1=GGUF instead of a 96GB tier.
+                try:
+                    if int(backend_index) == 0:
+                        selected = BF16_VRAM_TIER
+                except (TypeError, ValueError):
+                    pass
+            if selected is None:
+                selected = default_caption_vram_tier()
+            idx = self.caption_vram_tier_combo.findText(selected)
+            if idx >= 0:
+                self.caption_vram_tier_combo.setCurrentIndex(idx)
 
         with QSignalBlocker(self.caption_style_combo):
             if style:
@@ -1052,9 +1175,8 @@ class MainWindow(QMainWindow):
                 self.caption_instruction_edit.setPlainText(instruction)
 
     def _get_caption_backend(self):
-        backend_choice = self.caption_backend_combo.currentText()
         vram_tier = self.caption_vram_tier_combo.currentText()
-        key = (backend_choice, vram_tier)
+        key = vram_tier
         if getattr(self, "_caption_backend_key", None) == key and getattr(self, "_caption_backend", None) is not None:
             return self._caption_backend
 
@@ -1065,10 +1187,10 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        if backend_choice == "GGUF (VRAM tier)":
-            backend = GGUFBackend(vram_tier=vram_tier)
-        else:
+        if vram_tier == BF16_VRAM_TIER:
             backend = BF16Backend()
+        else:
+            backend = GGUFBackend(vram_tier=vram_tier)
         self._caption_backend = backend
         self._caption_backend_key = key
         return backend
@@ -1079,6 +1201,7 @@ class MainWindow(QMainWindow):
 
     def _start_single_captioner(self, worker):
         self.set_ai_buttons_enabled(False)
+        self._show_cancel_button()
         self.statusBar().showMessage("Initializing captioner...")
         self._active_caption_worker = worker  # keep a reference so it isn't GC'd
         worker.progress.connect(self.update_status)
@@ -1089,20 +1212,11 @@ class MainWindow(QMainWindow):
         if not self.file_manager.image_files:
             QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
             return False
-        reply = QMessageBox.question(
-            self, "Confirm",
-            f"Run AI captioning on all {len(self.file_manager.image_files)} images?\n\n"
-            "This will REPLACE each image's existing tags/caption with a newly generated "
-            "caption. This cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return False
 
         self.set_ai_buttons_enabled(False)
         self.progress_bar.setVisible(True)
         self.batch_status_label.setVisible(True)
-        self.cancel_batch_btn.setVisible(True)
+        self._show_cancel_button()
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(len(self.file_manager.image_files))
         self._active_batch_worker = worker
@@ -1115,6 +1229,13 @@ class MainWindow(QMainWindow):
         img_path = self.file_manager.get_current_image_path()
         if not img_path:
             return
+        info = caption_model_info(self.caption_vram_tier_combo.currentText())
+        if not self._confirm_model_download(
+            info,
+            action_title="この画像に自然言語キャプション (Qwen3.8) を実行します。",
+            extra_warning="この画像の既存タグは自然言語キャプションで上書きされます。",
+        ):
+            return
         try:
             backend = self._get_caption_backend()
         except Exception as e:
@@ -1126,6 +1247,14 @@ class MainWindow(QMainWindow):
     def run_batch_caption(self):
         if not self.file_manager.image_files:
             QMessageBox.warning(self, "Warning", "No images loaded in the folder.")
+            return
+        n = len(self.file_manager.image_files)
+        info = caption_model_info(self.caption_vram_tier_combo.currentText())
+        if not self._confirm_model_download(
+            info,
+            action_title=f"フォルダ内の全 {n} 枚に自然言語キャプション (Qwen3.8) を実行します。",
+            extra_warning="各画像の既存タグ／キャプションは上書きされます。元に戻せません。",
+        ):
             return
         try:
             backend = self._get_caption_backend()
@@ -1140,6 +1269,8 @@ class MainWindow(QMainWindow):
 
     def on_caption_finished(self, caption_text: str, error_msg: str):
         self.set_ai_buttons_enabled(True)
+        self._hide_cancel_button()
+        self._on_caption_vram_changed()
         self.statusBar().clearMessage()
         # Resolve the target from the worker, not the current view: the user
         # may have navigated to a different image while generation ran.
@@ -1171,8 +1302,8 @@ class MainWindow(QMainWindow):
         self.set_ai_buttons_enabled(True)
         self.progress_bar.setVisible(False)
         self.batch_status_label.setVisible(False)
-        self.cancel_batch_btn.setVisible(False)
-        self.cancel_batch_btn.setEnabled(True)
+        self._hide_cancel_button()
+        self._on_caption_vram_changed()
         self.statusBar().clearMessage()
         if error_msg:
             QMessageBox.critical(self, "Batch Caption Error", error_msg)

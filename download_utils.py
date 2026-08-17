@@ -6,13 +6,22 @@ from PyQt6.QtCore import QThread
 
 # ── Download / cache helpers (shared across AI features) ────────────────────
 
-def _cache_dir(subpath):
+def _cache_path(subpath=""):
+    """Return the cache path for `subpath` without creating directories."""
     root = os.environ.get("AI_TAGGER_CACHE_DIR") or os.path.join(
         os.path.expanduser("~"), ".cache", "ai_tagger"
     )
-    out = os.path.join(root, subpath)
+    return os.path.join(root, subpath) if subpath else root
+
+
+def _cache_dir(subpath):
+    out = _cache_path(subpath)
     os.makedirs(out, exist_ok=True)
     return out
+
+
+def _file_ready(path):
+    return os.path.isfile(path) and os.path.getsize(path) > 0
 
 
 def _stream_download(url, dest, progress_cb=None, label=None, max_retries=5):

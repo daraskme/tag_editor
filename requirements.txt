@@ -25,7 +25,9 @@ onnxruntime==1.24.4; sys_platform != 'win32'
 # CUDA packages here would silently bloat every install and every release
 # build for users who never touch captioning, and would require the CI
 # runner to have a matching NVIDIA GPU/CUDA toolkit just to build the .exe.
-# Install these yourself, only if you want the captioning feature:
+# The GUI now installs these automatically on the first natural-language
+# caption run (same worker as the model download). The commands below are
+# the same ones that path uses, kept here for manual/CI reference:
 #
 # torch/torchvision: must come from the PyTorch CUDA wheel index, not plain
 # PyPI (PyPI's torch is CPU-only on Windows).

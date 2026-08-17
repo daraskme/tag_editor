@@ -1,8 +1,11 @@
 import os
 import sys
 import io
+import re
 import time
 import base64
+import importlib
+import importlib.util
 import threading
 import subprocess
 import traceback
@@ -10,7 +13,7 @@ import traceback
 from PyQt6.QtCore import QThread, pyqtSignal
 from PIL import Image, ImageOps
 
-from download_utils import _cache_dir, _ensure_files
+from download_utils import _cache_dir, _cache_path, _file_ready, _ensure_files
 from ai_tagger import _composite_rgb, ImageReadError
 
 
@@ -261,6 +264,8 @@ class BF16Backend(CaptionBackend):
             if self._model is not None:
                 return
 
+            ensure_caption_runtime(BF16_VRAM_TIER, progress_cb=progress_cb)
+
             try:
                 import torch
             except ImportError as e:
@@ -473,6 +478,349 @@ GGUF_VRAM_TIERS = {
     "32GB": "Qwen3.8-27B-Uncensored-noMTP-Q8_0.gguf",
 }
 
+# 96GB uses the full BF16 weights; the rest map to GGUF quants above.
+BF16_VRAM_TIER = "96GB"
+CAPTION_VRAM_TIERS = ("12GB", "16GB", "24GB", "32GB", "96GB")
+GGUF_SIZE_HINTS = {
+    "12GB": "約10.2GB",
+    "16GB": "約15.1GB",
+    "24GB": "約22.1GB",
+    "32GB": "約28.6GB",
+}
+
+
+def _gpu_total_vram_mb():
+    """Best-effort total VRAM query (MB). None if it cannot be determined."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return info.total / (1024 * 1024)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            first_line = out.stdout.strip().splitlines()[0].strip()
+            return float(first_line)
+    except Exception:
+        pass
+
+    return None
+
+
+def default_caption_vram_tier():
+    """Pick a VRAM tier from detected total GPU memory. Falls back to 24GB."""
+    total = _gpu_total_vram_mb()
+    if total is None:
+        return "24GB"
+    if total >= 80_000:
+        return BF16_VRAM_TIER
+    if total >= 30_000:
+        return "32GB"
+    if total >= 22_000:
+        return "24GB"
+    if total >= 14_000:
+        return "16GB"
+    return "12GB"
+
+
+def _bf16_is_cached():
+    cache_root = _cache_path("aeon7_bf16")
+    rev_file = os.path.join(cache_root, "revision.txt")
+    if not os.path.isfile(rev_file):
+        return False
+    try:
+        with open(rev_file, encoding="utf-8") as f:
+            sha = f.read().strip()
+    except OSError:
+        return False
+    if not sha:
+        return False
+    snap = os.path.join(
+        cache_root,
+        "models--AEON-7--Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-BF16",
+        "snapshots",
+        sha,
+    )
+    if os.path.isdir(snap):
+        try:
+            names = os.listdir(snap)
+        except OSError:
+            return False
+        return "config.json" in names and any(n.endswith(".safetensors") for n in names)
+    for _dirpath, _dirnames, filenames in os.walk(cache_root):
+        if any(n.endswith(".safetensors") for n in filenames):
+            return True
+    return False
+
+
+def _gguf_is_cached(vram_tier):
+    quant = GGUF_VRAM_TIERS.get(vram_tier)
+    if not quant:
+        return False
+    cache_root = _cache_path(f"aeon7_gguf/{vram_tier}")
+    return (
+        _file_ready(os.path.join(cache_root, quant))
+        and _file_ready(os.path.join(cache_root, GGUF_MMPROJ_FILENAME))
+    )
+
+
+def caption_model_info(vram_tier):
+    """UI-facing description of the Qwen3.8 download selected by VRAM tier."""
+    runtime = caption_runtime_info(vram_tier)
+    if vram_tier == BF16_VRAM_TIER:
+        info = {
+            "tier": vram_tier,
+            "backend": "bf16",
+            "label": "Qwen3.8 BF16 (AEON-7)",
+            "repo": AEON7_REPO_ID,
+            "url": f"https://huggingface.co/{AEON7_REPO_ID}",
+            "size_hint": "約54GB",
+            "cached": _bf16_is_cached(),
+        }
+    else:
+        info = {
+            "tier": vram_tier,
+            "backend": "gguf",
+            "label": f"Qwen3.8 GGUF ({vram_tier})",
+            "repo": GGUF_REPO_ID,
+            "url": f"https://huggingface.co/{GGUF_REPO_ID}",
+            "size_hint": f"{GGUF_SIZE_HINTS.get(vram_tier, '?')} ＋vision用ファイル",
+            "cached": _gguf_is_cached(vram_tier),
+        }
+    info["runtime_ready"] = runtime["ready"]
+    info["runtime_missing"] = runtime["missing_labels"]
+    info["runtime_size_hint"] = runtime["size_hint"]
+    info["needs_download"] = (not info["cached"]) or (not runtime["ready"])
+    return info
+
+
+def _module_available(name):
+    return importlib.util.find_spec(name) is not None
+
+
+def caption_runtime_info(vram_tier):
+    """Which CUDA Python packages the selected VRAM tier still needs."""
+    if vram_tier == BF16_VRAM_TIER:
+        pkgs = [
+            {"label": "torch + torchvision (CUDA)", "ready": _module_available("torch")},
+            {"label": "transformers >= 5.12", "ready": _module_available("transformers")},
+            {"label": "accelerate", "ready": _module_available("accelerate")},
+        ]
+        size_hint = "約3GB"
+    else:
+        pkgs = [
+            {"label": "llama-cpp-python (CUDA)", "ready": _module_available("llama_cpp")},
+        ]
+        size_hint = "約200MB〜"
+    missing = [p["label"] for p in pkgs if not p["ready"]]
+    return {
+        "packages": pkgs,
+        "ready": not missing,
+        "missing_labels": missing,
+        "size_hint": size_hint,
+    }
+
+
+def _driver_cuda_version():
+    """Driver-reported CUDA version as a float (e.g. 13.0), or None."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi"], capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out.stdout)
+            if match:
+                return float(f"{match.group(1)}.{match.group(2)}")
+    except Exception:
+        pass
+    return None
+
+
+def _select_torch_spec():
+    cuda = _driver_cuda_version()
+    cu130 = {
+        "packages": ["torch==2.13.0+cu130", "torchvision==0.28.0+cu130"],
+        "index_url": "https://download.pytorch.org/whl/cu130",
+        "label": "torch + torchvision (CUDA 13.0)",
+        "size_hint": "約3GB",
+    }
+    cu124 = {
+        "packages": ["torch", "torchvision"],
+        "index_url": "https://download.pytorch.org/whl/cu124",
+        "label": "torch + torchvision (CUDA 12.4)",
+        "size_hint": "約3GB",
+    }
+    if cuda is not None and cuda < 13.0:
+        return cu124
+    return cu130
+
+
+def _torch_cuda_ready():
+    if not _module_available("torch"):
+        return False
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _transformers_version_ok():
+    if not _module_available("transformers"):
+        return False
+    try:
+        import transformers
+        parts = transformers.__version__.split(".")
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        return (major, minor) >= (5, 12)
+    except Exception:
+        return False
+
+
+def _pip_install(packages, index_url=None, extra_env=None, extra_args=None, progress_cb=None):
+    """Install packages with this process's Python. Raises RuntimeError on failure."""
+    if getattr(sys, "frozen", False):
+        raise RuntimeError(
+            "This packaged build cannot install Python packages. "
+            "Run from source (tag_editor_run.bat) to auto-download caption runtimes."
+        )
+
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    if extra_args:
+        cmd.extend(extra_args)
+    if index_url:
+        cmd.extend(["--index-url", index_url])
+    cmd.extend(packages)
+
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
+    startupinfo = None
+    creationflags = 0
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    if progress_cb:
+        progress_cb(f"Installing {' '.join(packages)}...")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        startupinfo=startupinfo,
+        creationflags=creationflags,
+    )
+    last_useful = ""
+    interesting = (
+        "downloading", "installing", "successfully", "collecting",
+        "error", "failed", "building", "using cached",
+    )
+    for raw in proc.stdout:
+        thread = QThread.currentThread()
+        if thread is not None and thread.isInterruptionRequested():
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            raise RuntimeError("Download cancelled")
+        line = raw.strip()
+        if not line:
+            continue
+        if progress_cb and any(key in line.lower() for key in interesting):
+            progress_cb(line[:240])
+            last_useful = line
+    if proc.wait() != 0:
+        raise RuntimeError(
+            f"Failed to install {packages}: {last_useful or f'pip exited {proc.returncode}'}"
+        )
+    importlib.invalidate_caches()
+
+
+def _ensure_bf16_runtime(progress_cb=None):
+    if not _torch_cuda_ready():
+        spec = _select_torch_spec()
+        if progress_cb:
+            progress_cb(
+                f"Downloading {spec['label']} ({spec['size_hint']}; "
+                "this is installed together with the model)..."
+            )
+        _pip_install(spec["packages"], index_url=spec["index_url"], progress_cb=progress_cb)
+        if not _torch_cuda_ready():
+            raise RuntimeError(
+                "Installed PyTorch but CUDA is not available. "
+                "A CPU-only wheel may have been installed; the BF16 backend needs a CUDA build."
+            )
+    if not _transformers_version_ok() or not _module_available("accelerate"):
+        if progress_cb:
+            progress_cb("Installing transformers and accelerate...")
+        _pip_install(["transformers>=5.12", "accelerate>=1.0"], progress_cb=progress_cb)
+
+
+def _ensure_gguf_runtime(progress_cb=None):
+    if _module_available("llama_cpp"):
+        return
+    if progress_cb:
+        progress_cb("Installing llama-cpp-python (CUDA wheel, together with the model)...")
+    try:
+        _pip_install(
+            ["llama-cpp-python"],
+            index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
+            progress_cb=progress_cb,
+        )
+        return
+    except RuntimeError as wheel_err:
+        if progress_cb:
+            progress_cb(
+                "CUDA wheel failed; building llama-cpp-python from source "
+                "(this can take ~10 minutes)..."
+            )
+        try:
+            _pip_install(
+                ["llama-cpp-python"],
+                extra_env={
+                    "CMAKE_ARGS": "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native",
+                    "FORCE_CMAKE": "1",
+                },
+                extra_args=["--no-cache-dir", "--force-reinstall"],
+                progress_cb=progress_cb,
+            )
+        except RuntimeError as src_err:
+            raise RuntimeError(
+                "Failed to install llama-cpp-python (CUDA). "
+                f"Wheel: {wheel_err}; source build: {src_err}"
+            ) from src_err
+
+
+def ensure_caption_runtime(vram_tier, progress_cb=None):
+    """Download the CUDA Python packages for `vram_tier` if they are missing.
+
+    Called from backend.load() so the first natural-language caption run
+    fetches runtime wheels and model weights in the same worker.
+    """
+    if vram_tier == BF16_VRAM_TIER:
+        _ensure_bf16_runtime(progress_cb)
+    else:
+        _ensure_gguf_runtime(progress_cb)
+
 
 def _gguf_free_vram_mb():
     """Best-effort free-VRAM query (MB). Tries pynvml, then falls back to
@@ -544,6 +892,8 @@ class GGUFBackend(CaptionBackend):
         with self._lock:
             if self._llm is not None:
                 return
+
+            ensure_caption_runtime(self.vram_tier, progress_cb=progress_cb)
 
             quant_filename = GGUF_VRAM_TIERS[self.vram_tier]
             cache_root = _cache_dir(f"aeon7_gguf/{self.vram_tier}")

@@ -7,7 +7,7 @@ import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 from PIL import Image, ImageOps
 
-from download_utils import _cache_dir, _stream_download, _ensure_files
+from download_utils import _cache_dir, _cache_path, _file_ready, _stream_download, _ensure_files
 
 
 # ── Device / ONNX Runtime providers ──────────────────────────────────────────
@@ -96,8 +96,25 @@ def _composite_rgb(img, background_color):
 
 OPPAI_REPO_ID = "Grio43/OppaiOracle"
 OPPAI_BASE_URL = f"https://huggingface.co/{OPPAI_REPO_ID}/resolve/main"
+OPPAI_REQUIRED_FILES = ("model.onnx", "vocabulary.json", "preprocessing.json")
 _oppai_cache = {}
 _oppai_cache_lock = threading.Lock()
+
+
+def oppai_is_cached(model_variant="V1.1"):
+    cache = _cache_path(f"oppai_oracle/{model_variant}_onnx")
+    return all(_file_ready(os.path.join(cache, name)) for name in OPPAI_REQUIRED_FILES)
+
+
+def oppai_model_info(model_variant="V1.1"):
+    """UI-facing description of the OppaiOracle download for `model_variant`."""
+    return {
+        "label": f"OppaiOracle {model_variant}",
+        "repo": OPPAI_REPO_ID,
+        "url": f"https://huggingface.co/{OPPAI_REPO_ID}",
+        "size_hint": "約1GB",
+        "cached": oppai_is_cached(model_variant),
+    }
 
 
 def _oppai_load(model_variant="V1.1", progress_cb=None, force_cpu=False):

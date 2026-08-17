@@ -1,5 +1,6 @@
-# Environments
+# Environments / secrets
 .env
+.env.*
 .venv
 env/
 venv/
@@ -7,23 +8,47 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local launcher stamp (copied from requirements.txt after pip install)
+.reqs_installed
+venv/.reqs_installed
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+
+# Python packaging / tooling
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # IDE / Editor
 .idea/
 .vscode/
 *.swp
 *.swo
+.cursor/
 
-# Downloaded AI models / Caches
+# Downloaded AI models / caches (multi-GB; never commit)
 *.onnx
+*.gguf
 *.safetensors
 *.bin
+*.pt
+*.pth
+*.ckpt
+*.npz
 huggingface/
 .cache/
+*.part
+*.tmp
 
 # OS generated files
 .DS_Store
@@ -33,13 +58,10 @@ huggingface/
 .Trashes
 ehthumbs.db
 Thumbs.db
+desktop.ini
 
 # Runtime logs
 *.log
-
-# PyInstaller build output (built locally / by CI, not committed)
-build/
-dist/
 
 # Project specifics
 *.csv
